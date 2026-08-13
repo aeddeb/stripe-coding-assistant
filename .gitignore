@@ -1,0 +1,22 @@
+# Secrets — never committed
+.env
+
+# Local data artifacts (raw fetches, processed chunks)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# dlt runtime state
+.dlt/secrets.toml
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
