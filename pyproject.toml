@@ -4,4 +4,12 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "dlt[postgres]>=1.30.0",
+    "huggingface-hub>=1.27.0",
+    "numpy>=2.5.2",
+    "onnxruntime>=1.28.0",
+    "openai>=3.1.0",
+    "pgvector>=0.5.0",
+    "psycopg[binary]>=3.3.4",
+    "tokenizers>=0.23.1",
+    "tqdm>=4.70.0",
 ]
