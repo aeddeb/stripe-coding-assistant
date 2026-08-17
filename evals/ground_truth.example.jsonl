@@ -1,0 +1,3 @@
+{"question": "How do I refund only part of a payment?", "source": "stackoverflow", "source_url": "https://stackoverflow.com/q/00000000", "answer_page_url": "https://docs.stripe.com/refunds.md"}
+{"question": "Charge a customer but capture the money later, after I ship the order", "source": "stackoverflow", "source_url": "https://stackoverflow.com/q/00000001", "answer_page_url": "https://docs.stripe.com/payments/place-a-hold-on-a-payment-method.md"}
+{"question": "Why did my webhook fire twice for the same payment?", "source": "synthetic", "source_url": null, "answer_page_url": "https://docs.stripe.com/webhooks.md"}
