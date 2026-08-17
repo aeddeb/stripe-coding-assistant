@@ -57,3 +57,55 @@ CREATE TABLE IF NOT EXISTS rag.experiments (
     notes       text,
     extra       jsonb             -- anything else: judge scores, latency, ...
 );
+
+-- ---------------------------------------------------------------------------
+-- Monitoring schema: what the running app observes. The Streamlit UI writes
+-- here on every question and thumbs click; the Grafana dashboard reads it.
+
+CREATE SCHEMA IF NOT EXISTS app;
+
+-- One row per chat session (one browser tab of the UI).
+CREATE TABLE IF NOT EXISTS app.conversations (
+    id         uuid PRIMARY KEY,
+    started_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- One row per question asked: what was asked, what was retrieved, what was
+-- answered, and how fast — everything the monitoring charts need.
+CREATE TABLE IF NOT EXISTS app.messages (
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    conversation_id  uuid NOT NULL REFERENCES app.conversations (id),
+    asked_at         timestamptz NOT NULL DEFAULT now(),
+    question         text NOT NULL,  -- stored after API-key redaction
+    answer           text,
+    -- How the question was handled: 'docs' (retrieved + answered),
+    -- 'refused' (out of scope / nothing relevant found), 'error'.
+    -- Future routes: 'spec' (OpenAPI lookup), 'sandbox' (execution proof).
+    route            text NOT NULL,
+    retrieval_config jsonb,          -- RetrievalConfig used for this answer
+    retrieved_chunks jsonb,          -- [{chunk_id, page_url, score}, ...]
+    latency_ms       integer,
+    -- Which provider/model actually generated the answer, and at what token
+    -- cost. Filled once the LLM client reports these per call.
+    provider         text,
+    model            text,
+    prompt_tokens    integer,
+    completion_tokens integer,
+    error            text,           -- exception text when route = 'error'
+    -- Router verdict for this question: scope decision, rewritten
+    -- sub-questions, and whether the router call itself failed (fail-open).
+    router           jsonb
+);
+
+-- Migration for databases created before the router column existed.
+ALTER TABLE app.messages ADD COLUMN IF NOT EXISTS router jsonb;
+
+CREATE INDEX IF NOT EXISTS messages_asked_at_idx
+    ON app.messages (asked_at);
+
+-- Thumbs rating, at most one per message; clicking again overwrites.
+CREATE TABLE IF NOT EXISTS app.feedback (
+    message_id bigint PRIMARY KEY REFERENCES app.messages (id),
+    rating     smallint NOT NULL CHECK (rating IN (-1, 1)),  -- 👎 / 👍
+    given_at   timestamptz NOT NULL DEFAULT now()
+);
