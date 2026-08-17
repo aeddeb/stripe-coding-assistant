@@ -1,0 +1,22 @@
+# Provisioned datasource: the same Postgres the app writes to, accessed as
+# the read-only role `grafana_ro` (created by db/grafana_role.py — SELECT
+# only, so dashboards can never modify data).
+apiVersion: 1
+
+datasources:
+  - name: Assistant Postgres
+    uid: appdb
+    type: postgres
+    access: proxy
+    # Container-to-container hostname on the compose network.
+    url: postgres:5432
+    user: grafana_ro
+    jsonData:
+      database: $POSTGRES_DB
+      sslmode: disable
+      postgresVersion: 1600
+      maxOpenConns: 4
+    secureJsonData:
+      password: $GRAFANA_DB_PASSWORD
+    isDefault: true
+    editable: false

@@ -1,0 +1,9 @@
+# Load every dashboard JSON in infra/grafana/dashboards/ at boot.
+apiVersion: 1
+
+providers:
+  - name: assistant-dashboards
+    type: file
+    disableDeletion: true
+    options:
+      path: /var/lib/grafana/dashboards

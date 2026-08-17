@@ -1,0 +1,105 @@
+{
+  "uid": "stripe-assistant",
+  "title": "Stripe Coding Assistant — Monitoring",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-7d", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Questions over time",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "appdb" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('hour', asked_at) AS time, count(*) AS questions FROM app.messages WHERE $__timeFilter(asked_at) GROUP BY 1 ORDER BY 1"
+        }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 60 } }, "overrides": [] }
+    },
+    {
+      "id": 2,
+      "title": "Route distribution",
+      "description": "docs = answered from retrieved docs, refused = out of scope, error = pipeline failure",
+      "type": "piechart",
+      "datasource": { "type": "postgres", "uid": "appdb" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT route, count(*) AS questions FROM app.messages WHERE $__timeFilter(asked_at) GROUP BY route"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Feedback",
+      "type": "stat",
+      "datasource": { "type": "postgres", "uid": "appdb" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) FILTER (WHERE f.rating = 1) AS \"👍 up\", count(*) FILTER (WHERE f.rating = -1) AS \"👎 down\" FROM app.feedback f JOIN app.messages m ON m.id = f.message_id WHERE $__timeFilter(m.asked_at)"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Answer latency",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "appdb" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('hour', asked_at) AS time, avg(latency_ms) AS avg_ms, percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms FROM app.messages WHERE $__timeFilter(asked_at) AND latency_ms IS NOT NULL GROUP BY 1 ORDER BY 1"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "title": "Top retrieval score (grounding proxy)",
+      "description": "Score of the best-ranked chunk per question — a falling trend means questions are drifting away from what the corpus covers",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "appdb" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('hour', asked_at) AS time, avg((retrieved_chunks->0->>'score')::float) AS top_score FROM app.messages WHERE $__timeFilter(asked_at) AND jsonb_array_length(retrieved_chunks) > 0 GROUP BY 1 ORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Recent questions",
+      "type": "table",
+      "datasource": { "type": "postgres", "uid": "appdb" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT m.asked_at AS \"asked\", left(m.question, 90) AS \"question\", m.route, m.latency_ms AS \"ms\", coalesce(f.rating::text, '') AS \"rating\" FROM app.messages m LEFT JOIN app.feedback f ON f.message_id = m.id WHERE $__timeFilter(m.asked_at) ORDER BY m.asked_at DESC LIMIT 25"
+        }
+      ]
+    }
+  ]
+}

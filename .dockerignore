@@ -1,0 +1,13 @@
+# Never bake secrets or local state into images.
+.env
+.git/
+.venv/
+data/
+scratch/
+__pycache__/
+*.py[cod]
+.dlt/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
