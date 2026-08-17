@@ -8,7 +8,9 @@ Stripe serves its docs as markdown, so heading structure is reliable:
    path (e.g. ``Refunds > Partial refunds``) as retrieval metadata.
 2. Sections longer than ``MAX_CHARS`` are split further at paragraph
    boundaries, with the previous paragraph carried over as overlap so a
-   sentence's context is never cut mid-thought.
+   sentence's context is never cut mid-thought. A single paragraph that
+   itself exceeds ``MAX_CHARS`` (a long table or code block with no blank
+   lines) is split at line boundaries, so every chunk stays bounded.
 3. Consecutive tiny fragments are merged forward until they reach
    ``MIN_CHARS``, so no chunk is a lone heading or one-liner.
 
@@ -96,14 +98,20 @@ def _split_long(text: str, max_chars: int = MAX_CHARS) -> list[str]:
     if len(text) <= max_chars:
         return [text]
 
-    paragraphs = re.split(r"\n\n+", text)
+    # A paragraph larger than the cap on its own (a table or code block
+    # with no blank lines) is split at line boundaries first, so the
+    # packing loop below only ever sees pieces that fit.
+    paragraphs: list[str] = []
+    for para in re.split(r"\n\n+", text):
+        if len(para) > max_chars:
+            paragraphs.extend(_split_at_lines(para, max_chars))
+        else:
+            paragraphs.append(para)
+
     pieces: list[str] = []
     current: list[str] = []
     size = 0
     for para in paragraphs:
-        # A single paragraph larger than the cap (usually a code block)
-        # becomes its own piece; the embedder truncates it, but keyword
-        # search still sees all of it.
         if size + len(para) > max_chars and current:
             pieces.append("\n\n".join(current))
             # Overlap: carry the tail of the previous piece forward.
@@ -115,6 +123,37 @@ def _split_long(text: str, max_chars: int = MAX_CHARS) -> list[str]:
             size += len(para)
     if current:
         pieces.append("\n\n".join(current))
+    return pieces
+
+
+def _split_at_lines(paragraph: str, max_chars: int) -> list[str]:
+    """Split a blank-line-free paragraph into pieces of at most ``max_chars``.
+
+    Splits at line boundaries (table rows, lines of code). A single line
+    longer than the cap — rare — is sliced at the cap as a last resort.
+    """
+    pieces: list[str] = []
+    current: list[str] = []
+    size = 0
+
+    def flush() -> None:
+        nonlocal size
+        if current:
+            pieces.append("\n".join(current))
+            current.clear()
+            size = 0
+
+    for line in paragraph.splitlines():
+        if len(line) > max_chars:
+            flush()
+            for start in range(0, len(line), max_chars):
+                pieces.append(line[start : start + max_chars])
+            continue
+        if size + len(line) > max_chars:
+            flush()
+        current.append(line)
+        size += len(line) + 1  # +1 for the newline joiner
+    flush()
     return pieces
 
 
