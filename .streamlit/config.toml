@@ -1,0 +1,7 @@
+# Streamlit enables single-key developer shortcuts (R = rerun, C = clear
+# cache) when the app is viewed from localhost, and its key handler does
+# not ignore the Cmd/Ctrl modifier — so Cmd+C to copy text opens the
+# "Clear cache" dialog. Viewer mode disables developer options and their
+# shortcuts, which is the right posture for a public demo anyway.
+[client]
+toolbarMode = "viewer"

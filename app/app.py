@@ -35,12 +35,20 @@ import streamlit as st
 from psycopg.types.json import Jsonb
 
 from services import db
-from agent.sandbox import FLOWS, SandboxTrace, match_flow, run_flow
-from services.answer import PROMPT_VARIANTS, Answer, answer_routed
+from agent.sandbox import FLOWS, SandboxTrace, match_flow, preview_flow, run_flow
+from services.answer import (
+    CODE_LANGUAGES,
+    PROMPT_VARIANTS,
+    Answer,
+    answer_routed,
+    language_instruction,
+)
 
-# Winner of the LLM evaluation (see README): best faithfulness (1.91/2)
-# and both-perfect rate (91%) across the ground-truth question set.
-SERVING_PROMPT = PROMPT_VARIANTS["v2-answer-first"]
+# Winner of the LLM evaluation (see README): best faithfulness (1.93/2)
+# and relevance (2.00/2) across the ground-truth question set. The
+# code-language rules are appended per question at serving time — the
+# evaluation compared the bare variants.
+SERVING_PROMPT = PROMPT_VARIANTS["v3-explained-summary"]
 from services.retrieval import RetrievalConfig
 
 LOGGER = logging.getLogger(__name__)
@@ -199,10 +207,13 @@ def _save_feedback(message_id: int, widget_key: str) -> None:
 def _answer_and_log(question: str) -> dict:
     """Run the pipeline, log the exchange, return a renderable entry."""
     error = None
+    prompt = SERVING_PROMPT + language_instruction(
+        st.session_state.get("code_language", CODE_LANGUAGES[0])
+    )
     try:
         with db.connect() as conn:
             ans = answer_routed(
-                question, SERVING_CONFIG, conn, system_prompt=SERVING_PROMPT
+                question, SERVING_CONFIG, conn, system_prompt=prompt
             )
     except Exception as exc:
         LOGGER.exception("answer pipeline failed")
@@ -248,12 +259,16 @@ def _render_answer(entry: dict) -> None:
     flow_key = entry.get("sandbox_flow")
     if flow_key:
         entry_key = entry.get("message_id") or "draft"
-        with st.expander("🧪 Sandbox proof — run it in Stripe test mode"):
+        with st.expander("🧪 Stripe Sandbox — run the sample code in Stripe Test Mode"):
             st.caption(
                 "This executes the recommended flow "
                 f"(**{FLOWS[flow_key]['label']}**) against Stripe's test-mode "
-                "sandbox — real API calls, no real money — and shows the trace."
+                "sandbox — real API calls, no real money. The payloads below "
+                "are exactly what will be sent."
             )
+            for i, planned in enumerate(preview_flow(flow_key), start=1):
+                st.markdown(f"**{i}. `{planned['call']}`** — {planned['note']}")
+                st.json(planned["request"], expanded=True)
             trace_key = f"sandbox_trace_{entry_key}"
             if st.button(
                 "▶ Run it", key=f"sandbox_btn_{entry_key}"
@@ -274,11 +289,16 @@ def _render_trace(trace: SandboxTrace) -> None:
     if trace.error:
         st.error(trace.error)
         return
-    st.markdown(f"**{trace.title}**")
+    # The request payloads are already on screen (the pre-run preview), so
+    # the trace shows what came back for each call.
+    st.markdown(f"**{trace.title}** — executed:")
     for i, step in enumerate(trace.steps, start=1):
-        st.markdown(f"**{i}. `{step.call}`** → `{step.object_id}`")
-        st.json(step.request, expanded=False)
-        st.markdown(f"status: **`{step.status}`** — {step.note}")
+        st.markdown(
+            f"**{i}. `{step.call}`** → `{step.object_id}` — "
+            f"status **`{step.status}`**, {step.note}"
+        )
+        st.caption("Response returned (null fields omitted)")
+        st.json(step.response, expanded=False)
     if trace.events:
         st.markdown("**Events Stripe recorded** (what your webhook would receive):")
         st.markdown(" → ".join(f"`{e['type']}`" for e in trace.events))
@@ -305,6 +325,14 @@ with st.sidebar:
     )
     for q in EXAMPLE_QUESTIONS:
         st.markdown(f"- *{q}*")
+    st.divider()
+    st.selectbox(
+        "Code samples in",
+        CODE_LANGUAGES,
+        key="code_language",
+        help="Answers write their code samples in this language, "
+        "whatever language the underlying docs page uses.",
+    )
     st.divider()
     st.caption(
         "Answers are generated from retrieved documentation and can be "

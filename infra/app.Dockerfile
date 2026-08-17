@@ -13,6 +13,7 @@ RUN uv sync --frozen --no-dev
 COPY services/ services/
 COPY agent/ agent/
 COPY app/ app/
+COPY .streamlit/ .streamlit/
 
 # Bake the ONNX embedding model (~90 MB) into the image so the container
 # needs no network access at query time.

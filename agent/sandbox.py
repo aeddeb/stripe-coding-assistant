@@ -1,9 +1,10 @@
 """Stripe test-mode sandbox execution: prove an answer by running it.
 
 When an answer describes an executable payment flow, this module runs that
-flow against Stripe's test mode and returns the trace — every API call, the
-status transitions, and the events Stripe recorded (the same events a
-webhook endpoint would receive, in order). Answer plus evidence.
+flow against Stripe's test mode and returns the trace — every API call with
+the exact request payload sent and the full response returned, the status
+transitions, and the events Stripe recorded (the same events a webhook
+endpoint would receive, in order). Answer plus evidence.
 
 Safety:
 - Executes ONLY with a test-mode key (``sk_test_...``). Anything else is
@@ -27,7 +28,8 @@ class TraceStep:
     """One API call in an executed flow."""
 
     call: str  # e.g. "PaymentIntent.create"
-    request: dict  # the interesting request params (not the full payload)
+    request: dict  # the exact params sent to the API
+    response: dict  # the full API response, null fields dropped
     object_id: str
     status: str
     note: str = ""
@@ -59,6 +61,53 @@ def _client() -> stripe.StripeClient:
     return stripe.StripeClient(key)
 
 
+def _response_dict(obj: stripe.StripeObject) -> dict:
+    """The full API response as plain JSON-able data. Stripe pads responses
+    with many null fields; drop them so the trace stays readable without
+    hiding anything that carries a value."""
+    return _strip_nulls(obj.to_dict(for_json=True))
+
+
+def _strip_nulls(value):
+    if isinstance(value, dict):
+        return {k: _strip_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_strip_nulls(v) for v in value]
+    return value
+
+
+def _hold_and_capture_request(amount_cents: int) -> dict:
+    """The exact PaymentIntent.create payload the flow sends."""
+    return {
+        "amount": amount_cents,
+        "currency": "usd",
+        "capture_method": "manual",  # hold now, capture later
+        "confirm": True,
+        "payment_method": "pm_card_visa",  # Stripe's test Visa
+        "automatic_payment_methods": {
+            "enabled": True,
+            "allow_redirects": "never",
+        },
+    }
+
+
+def preview_hold_and_capture(amount_cents: int = 5000) -> list[dict]:
+    """The calls the flow will make, with their exact payloads — so the
+    trace can be shown to the user before anything executes."""
+    return [
+        {
+            "call": "PaymentIntent.create",
+            "request": _hold_and_capture_request(amount_cents),
+            "note": "places the hold on a test card",
+        },
+        {
+            "call": "PaymentIntent.capture",
+            "request": {"payment_intent": "<id returned by step 1>"},
+            "note": "captures the held funds",
+        },
+    ]
+
+
 def run_hold_and_capture(amount_cents: int = 5000) -> SandboxTrace:
     """Place a hold on a card, then capture it — the classic
     authorize-now-capture-on-shipment flow."""
@@ -71,25 +120,13 @@ def run_hold_and_capture(amount_cents: int = 5000) -> SandboxTrace:
     try:
         client = _client()
 
-        create_params = {
-            "amount": amount_cents,
-            "currency": "usd",
-            "capture_method": "manual",  # hold now, capture later
-            "confirm": True,
-            "payment_method": "pm_card_visa",  # Stripe's test Visa
-            "automatic_payment_methods": {
-                "enabled": True,
-                "allow_redirects": "never",
-            },
-        }
+        create_params = _hold_and_capture_request(amount_cents)
         intent = client.v1.payment_intents.create(params=create_params)
         trace.steps.append(
             TraceStep(
                 call="PaymentIntent.create",
-                request={
-                    k: create_params[k]
-                    for k in ("amount", "currency", "capture_method", "confirm", "payment_method")
-                },
+                request=create_params,
+                response=_response_dict(intent),
                 object_id=intent.id,
                 status=intent.status,
                 note="money is held on the card, not yet moved",
@@ -100,7 +137,9 @@ def run_hold_and_capture(amount_cents: int = 5000) -> SandboxTrace:
         trace.steps.append(
             TraceStep(
                 call="PaymentIntent.capture",
+                # Capture takes the id in the URL path; no body params sent.
                 request={"payment_intent": intent.id},
+                response=_response_dict(captured),
                 object_id=captured.id,
                 status=captured.status,
                 note="the held funds are now captured",
@@ -162,6 +201,7 @@ FLOWS = {
             re.IGNORECASE,
         ),
         "run": run_hold_and_capture,
+        "preview": preview_hold_and_capture,
         "label": "place a hold, then capture it",
     },
 }
@@ -173,6 +213,11 @@ def match_flow(question: str) -> str | None:
         if flow["pattern"].search(question):
             return key
     return None
+
+
+def preview_flow(key: str) -> list[dict]:
+    """The flow's planned calls and payloads, without executing anything."""
+    return FLOWS[key]["preview"]()
 
 
 def run_flow(key: str) -> SandboxTrace:
