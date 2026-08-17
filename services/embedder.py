@@ -28,6 +28,11 @@ EMBEDDING_DIM = 384
 class Embedder:
     def __init__(self, path: Path = MODEL_DIR):
         path = Path(path)
+        if not ((path / "tokenizer.json").exists() and (path / "model.onnx").exists()):
+            # Model files are not in the repo (data/ is gitignored). Docker
+            # bakes them at build time; other hosts (e.g. Streamlit Cloud)
+            # download them on first use.
+            ensure_model(dest=path)
         self.tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
         self.session = ort.InferenceSession(
             str(path / "model.onnx"), providers=["CPUExecutionProvider"]
