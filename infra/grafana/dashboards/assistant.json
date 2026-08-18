@@ -1,105 +1,462 @@
 {
   "uid": "stripe-assistant",
-  "title": "Stripe Coding Assistant — Monitoring",
+  "title": "Stripe Coding Assistant \u2014 Monitoring",
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 6,
   "refresh": "30s",
-  "time": { "from": "now-7d", "to": "now" },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
   "panels": [
     {
+      "id": 100,
+      "type": "row",
+      "title": "Usage \u2014 is anyone using it, and what are they asking?",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
       "id": 1,
-      "title": "Questions over time",
+      "title": "Questions asked",
       "type": "timeseries",
-      "datasource": { "type": "postgres", "uid": "appdb" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": {
+        "type": "postgres",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
       "targets": [
         {
           "refId": "A",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT date_trunc('hour', asked_at) AS time, count(*) AS questions FROM app.messages WHERE $__timeFilter(asked_at) GROUP BY 1 ORDER BY 1"
+          "rawSql": "SELECT $__timeGroup(asked_at, '1h', 0) AS time, count(*) AS questions FROM app.messages WHERE $__timeFilter(asked_at) GROUP BY 1 ORDER BY 1",
+          "datasource": {
+            "type": "postgres",
+            "uid": "${ds}"
+          }
         }
       ],
-      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 60 } }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "How many questions people asked, per hour. Empty hours are drawn as zero rather than skipped, so a flat line means nobody visited."
     },
     {
       "id": 2,
-      "title": "Route distribution",
-      "description": "docs = answered from retrieved docs, refused = out of scope, error = pipeline failure",
-      "type": "piechart",
-      "datasource": { "type": "postgres", "uid": "appdb" },
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
-      "targets": [
-        {
-          "refId": "A",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT route, count(*) AS questions FROM app.messages WHERE $__timeFilter(asked_at) GROUP BY route"
-        }
-      ]
-    },
-    {
-      "id": 3,
-      "title": "Feedback",
-      "type": "stat",
-      "datasource": { "type": "postgres", "uid": "appdb" },
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
-      "targets": [
-        {
-          "refId": "A",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT count(*) FILTER (WHERE f.rating = 1) AS \"👍 up\", count(*) FILTER (WHERE f.rating = -1) AS \"👎 down\" FROM app.feedback f JOIN app.messages m ON m.id = f.message_id WHERE $__timeFilter(m.asked_at)"
-        }
-      ]
-    },
-    {
-      "id": 4,
-      "title": "Answer latency",
+      "title": "How questions were handled",
+      "description": "One stacked bar per day, so a run of failures shows up as the day it happened rather than as a permanent-looking total. Green = answered from the docs with citations. Amber = refused, meaning off-topic or nothing relevant found, which is the app declining rather than guessing. Red = failed, something broke. Days with no questions are drawn as empty.",
       "type": "timeseries",
-      "datasource": { "type": "postgres", "uid": "appdb" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": {
+        "type": "postgres",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
       "targets": [
         {
           "refId": "A",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT date_trunc('hour', asked_at) AS time, avg(latency_ms) AS avg_ms, percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms FROM app.messages WHERE $__timeFilter(asked_at) AND latency_ms IS NOT NULL GROUP BY 1 ORDER BY 1"
+          "rawSql": "SELECT $__timeGroup(asked_at, '1d', 0) AS time, CASE route WHEN 'docs' THEN 'Answered' WHEN 'refused' THEN 'Refused' WHEN 'error' THEN 'Failed' ELSE route END AS metric, count(*) AS value FROM app.messages WHERE $__timeFilter(asked_at) GROUP BY 1, 2 ORDER BY 1",
+          "datasource": {
+            "type": "postgres",
+            "uid": "${ds}"
+          }
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] }
-    },
-    {
-      "id": 5,
-      "title": "Top retrieval score (grounding proxy)",
-      "description": "Score of the best-ranked chunk per question — a falling trend means questions are drifting away from what the corpus covers",
-      "type": "timeseries",
-      "datasource": { "type": "postgres", "uid": "appdb" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "targets": [
-        {
-          "refId": "A",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT date_trunc('hour', asked_at) AS time, avg((retrieved_chunks->0->>'score')::float) AS top_score FROM app.messages WHERE $__timeFilter(asked_at) AND jsonb_array_length(retrieved_chunks) > 0 GROUP BY 1 ORDER BY 1"
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
         }
-      ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 85,
+            "lineWidth": 0,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Answered"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Refused"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      }
     },
     {
       "id": 6,
       "title": "Recent questions",
       "type": "table",
-      "datasource": { "type": "postgres", "uid": "appdb" },
-      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 16 },
+      "datasource": {
+        "type": "postgres",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
       "targets": [
         {
           "refId": "A",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT m.asked_at AS \"asked\", left(m.question, 90) AS \"question\", m.route, m.latency_ms AS \"ms\", coalesce(f.rating::text, '') AS \"rating\" FROM app.messages m LEFT JOIN app.feedback f ON f.message_id = m.id WHERE $__timeFilter(m.asked_at) ORDER BY m.asked_at DESC LIMIT 25"
+          "rawSql": "SELECT m.asked_at AS \"asked\", left(m.question, 70) AS \"question\", m.route, coalesce(m.provider, '') AS \"provider\", coalesce(m.model, '') AS \"model\", coalesce(m.prompt_tokens, 0) + coalesce(m.completion_tokens, 0) AS \"tokens\", CASE WHEN m.cached THEN 'cache' ELSE '' END AS \"from\", m.latency_ms AS \"ms\", coalesce(f.rating::text, '') AS \"rating\" FROM app.messages m LEFT JOIN app.feedback f ON f.message_id = m.id WHERE $__timeFilter(m.asked_at) ORDER BY m.asked_at DESC LIMIT 25",
+          "datasource": {
+            "type": "postgres",
+            "uid": "${ds}"
+          }
         }
-      ]
+      ],
+      "description": "One row per user question. `model` is the model that wrote the answer; `tokens` is that answer call only. A blank model means no model ran \u2014 the question was refused, errored, or the answer came from the cache."
+    },
+    {
+      "id": 101,
+      "type": "row",
+      "title": "Cost \u2014 what the model providers are being asked to do",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "panels": []
+    },
+    {
+      "id": 9,
+      "title": "API calls per day  (2 calls = 1 question)",
+      "description": "Counts individual calls to the model providers, NOT user questions. Answering one question normally costs two calls: a routing call that decides scope and rewrites the question for search, then the answer call itself. A question served from the local cache costs no calls and does not appear here \u2014 compare with 'Questions over time' to see the difference.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "postgres",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 19
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "${ds}"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "WITH calls AS (  SELECT asked_at, model, 'answer' AS call_type  FROM app.messages  WHERE $__timeFilter(asked_at)    AND model IS NOT NULL    AND coalesce(cached, false) = false  UNION ALL  SELECT asked_at, router->'usage'->>'model' AS model, 'routing' AS call_type  FROM app.messages  WHERE $__timeFilter(asked_at)    AND router->'usage'->>'model' IS NOT NULL    AND coalesce((router->'usage'->>'cached')::boolean, false) = false) SELECT date_trunc('day', asked_at) AS time, model || ' \u00b7 ' || call_type AS metric, count(*) AS value FROM calls GROUP BY 1, 2 ORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 70,
+            "stacking": {
+              "mode": "normal"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "title": "Token spend per day",
+      "description": "Tokens actually bought from the model providers each day, counting both calls a question makes: the routing call and the answer call. Answers served from the local cache cost nothing and are excluded.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "postgres",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 19
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "${ds}"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "WITH billed AS (  SELECT asked_at,    CASE WHEN coalesce(cached, false) THEN 0         ELSE coalesce(prompt_tokens, 0) END    + CASE WHEN coalesce((router->'usage'->>'cached')::boolean, false) THEN 0           ELSE coalesce((router->'usage'->>'prompt_tokens')::int, 0) END      AS prompt_tokens,    CASE WHEN coalesce(cached, false) THEN 0         ELSE coalesce(completion_tokens, 0) END    + CASE WHEN coalesce((router->'usage'->>'cached')::boolean, false) THEN 0           ELSE coalesce((router->'usage'->>'completion_tokens')::int, 0) END      AS completion_tokens  FROM app.messages WHERE $__timeFilter(asked_at)) SELECT date_trunc('day', asked_at) AS time, sum(prompt_tokens) AS prompt_tokens, sum(completion_tokens) AS completion_tokens FROM billed GROUP BY 1 ORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "stacking": {
+              "mode": "normal"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "title": "Which provider answered",
+      "description": "The app tries its primary provider first and falls back to a second one when that is rate-limited or down, so a change of colour here means the fallback took over. Only questions a model actually answered are counted; refused and failed questions never reach a provider and are shown under 'How questions were handled' instead.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "postgres",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 19
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "${ds}"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('day', asked_at) AS time, provider AS metric, count(*) AS value FROM app.messages WHERE $__timeFilter(asked_at) AND provider IS NOT NULL GROUP BY 1, 2 ORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "stacking": {
+              "mode": "normal"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 102,
+      "type": "row",
+      "title": "Quality & speed \u2014 is it any good?",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "panels": []
+    },
+    {
+      "id": 4,
+      "title": "Answer speed",
+      "type": "timeseries",
+      "datasource": {
+        "type": "postgres",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('hour', asked_at) AS time, avg(latency_ms) AS avg_ms, percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms FROM app.messages WHERE $__timeFilter(asked_at) AND latency_ms IS NOT NULL GROUP BY 1 ORDER BY 1",
+          "datasource": {
+            "type": "postgres",
+            "uid": "${ds}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "description": "Time from question to finished answer. p95 is the slow tail: 95% of questions were faster than this line, so it shows the worst experience a typical visitor gets, not the average one."
+    },
+    {
+      "id": 5,
+      "title": "How well the docs search matched",
+      "description": "Similarity between the question and the single best-matching documentation chunk, on a 0-to-1 scale where higher is better. Low values mean the search scraped the barrel, which is when answers get vague or the app refuses. Only comparable between questions answered with the same retrieval settings.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "postgres",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('hour', asked_at) AS time, avg((retrieved_chunks->0->>'score')::float) AS top_score FROM app.messages WHERE $__timeFilter(asked_at) AND jsonb_array_length(retrieved_chunks) > 0 GROUP BY 1 ORDER BY 1",
+          "datasource": {
+            "type": "postgres",
+            "uid": "${ds}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "unit": "none"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "title": "Rated answers \u2014 what people liked and disliked",
+      "description": "Every answer a visitor rated, worst first. Counts on their own cannot tell you anything actionable; the question and the model behind a thumbs-down can.",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "${ds}"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT m.asked_at AS \"asked\", CASE f.rating WHEN 1 THEN '\ud83d\udc4d good' ELSE '\ud83d\udc4e bad' END AS \"verdict\", left(m.question, 70) AS \"question\", coalesce(m.model, '') AS \"model\", m.latency_ms AS \"ms\" FROM app.feedback f JOIN app.messages m ON m.id = f.message_id WHERE $__timeFilter(m.asked_at) ORDER BY f.rating ASC, m.asked_at DESC LIMIT 25"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
     }
-  ]
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "ds",
+        "label": "Database",
+        "type": "datasource",
+        "query": "postgres",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      }
+    ]
+  }
 }

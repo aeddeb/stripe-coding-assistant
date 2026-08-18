@@ -132,7 +132,15 @@ Try it standalone: `uv run --env-file .env python -m agent.sandbox`
 
 ## Monitoring
 
-Every exchange is logged to Postgres, and every answer takes 👍/👎 feedback in the UI. A provisioned Grafana instance (started by `make up`, at `localhost:3000`, read-only DB role) ships with a six-panel dashboard: questions over time, route distribution (answered / refused / errored), feedback counts, answer latency, top retrieval score per question, and a live table of recent questions.
+Every exchange is logged to Postgres, and every answer takes 👍/👎 feedback in the UI. A provisioned Grafana instance (started by `make up`, at `localhost:3000`, read-only DB role) ships with a dashboard grouped into three sections, each answering one question:
+
+- **Usage** — is anyone using it, and what are they asking? Questions per hour, outcomes stacked per day (green answered, amber refused, red failed) so an outage reads as the day it happened rather than a permanent-looking total, and a live table of the last 25 questions with the model behind each answer.
+- **Cost** — API calls per day, token spend per day, and which provider answered.
+- **Quality & speed** — answer time including the slow tail, how well the documentation search matched the question, and every answer a visitor rated, worst first.
+
+Answering one question costs two model calls: a routing call that decides scope and rewrites the question for search, then the answer call itself. The cost panels count both. This is why the API-calls panel and the questions panel disagree, and deliberately so — one counts calls billed by the provider, the other counts people asking things. Answers served from the local response cache make no API call at all and appear in neither cost panel.
+
+A **Database** picker at the top of the dashboard chooses which database the panels read. Both are provisioned: the local one from `docker-compose`, and the cloud one behind the live demo, so the same dashboard shows local test traffic or real visitor traffic without editing a panel.
 
 ## How to run it
 
