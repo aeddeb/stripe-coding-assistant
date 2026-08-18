@@ -1,0 +1,26 @@
+# Provisioned datasource: the deployed app's cloud Postgres (Neon), so the
+# same dashboards used locally can also show real traffic from the live
+# deployment. Accessed as the read-only role `grafana_ro` (created by
+# db/grafana_role.py — SELECT only, so dashboards can never modify data).
+#
+# This is a second, separate datasource — it does not replace or affect
+# the local Postgres datasource defined in postgres.yml.
+apiVersion: 1
+
+datasources:
+  - name: Assistant Postgres (Neon)
+    uid: neondb
+    type: postgres
+    access: proxy
+    # host:port of the Neon endpoint.
+    url: $NEON_DB_HOST
+    user: grafana_ro
+    jsonData:
+      database: $NEON_DB_NAME
+      sslmode: require
+      postgresVersion: 1600
+      maxOpenConns: 4
+    secureJsonData:
+      password: $NEON_GRAFANA_DB_PASSWORD
+    isDefault: false
+    editable: false

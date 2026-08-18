@@ -59,9 +59,17 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_ANALYTICS_REPORTING_ENABLED: "false"
-      # Interpolated into the provisioned datasource (read-only DB role).
+      # Interpolated into the local-Postgres provisioned datasource
+      # (read-only DB role).
       GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:-grafana}
       POSTGRES_DB: ${POSTGRES_DB:-stripe_assistant}
+      # Interpolated into the Neon (cloud) provisioned datasource — a
+      # second, read-only view onto the deployed app's database. Empty
+      # defaults so a fresh clone with no Neon project still boots; the
+      # datasource just won't have credentials until these are set.
+      NEON_DB_HOST: ${NEON_DB_HOST:-}
+      NEON_DB_NAME: ${NEON_DB_NAME:-}
+      NEON_GRAFANA_DB_PASSWORD: ${NEON_GRAFANA_DB_PASSWORD:-}
     volumes:
       # Datasource + dashboard definitions live in git; the container
       # discovers them at boot — no manual setup.

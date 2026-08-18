@@ -160,6 +160,16 @@ The live demo runs on free tiers:
 - **Database** — [Neon](https://neon.tech) serverless Postgres with pgvector, loaded with the same corpus as local. The app connects through `DATABASE_URL` when it is set, so the same code serves both environments.
 - **Secrets** — kept in Streamlit's secrets manager, not in the repo.
 
+The local Grafana can read the cloud database too, which is how the dashboard shows real visitor traffic. Create the read-only role on it once:
+
+```bash
+DATABASE_URL=<neon connection string> \
+GRAFANA_DB_PASSWORD=<pick a password> \
+  uv run python -m db.grafana_role
+```
+
+Then set `NEON_DB_HOST`, `NEON_DB_NAME`, and `NEON_GRAFANA_DB_PASSWORD` in `.env` and restart Grafana. Leave them unset and the dashboard simply runs against the local database.
+
 ## Next steps
 
 - More sandbox flows (refunds, subscriptions with trials) — the flow registry is built to take them.
