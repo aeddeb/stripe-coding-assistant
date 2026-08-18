@@ -86,19 +86,27 @@ CREATE TABLE IF NOT EXISTS app.messages (
     retrieved_chunks jsonb,          -- [{chunk_id, page_url, score}, ...]
     latency_ms       integer,
     -- Which provider/model actually generated the answer, and at what token
-    -- cost. Filled once the LLM client reports these per call.
+    -- cost. The provider is not known before the call: the LLM client falls
+    -- through a chain of providers, so a request meant for the primary can
+    -- be served by the fallback. Token counts cover the answer call only —
+    -- the routing call reports its own inside `router`.
     provider         text,
     model            text,
     prompt_tokens    integer,
     completion_tokens integer,
+    -- True when the answer was served from the local response cache, so no
+    -- API call was made. Token-spend charts exclude these rows: the counts
+    -- describe the original call, not new spend.
+    cached           boolean,
     error            text,           -- exception text when route = 'error'
     -- Router verdict for this question: scope decision, rewritten
     -- sub-questions, and whether the router call itself failed (fail-open).
     router           jsonb
 );
 
--- Migration for databases created before the router column existed.
+-- Migrations for databases created before these columns existed.
 ALTER TABLE app.messages ADD COLUMN IF NOT EXISTS router jsonb;
+ALTER TABLE app.messages ADD COLUMN IF NOT EXISTS cached boolean;
 
 CREATE INDEX IF NOT EXISTS messages_asked_at_idx
     ON app.messages (asked_at);

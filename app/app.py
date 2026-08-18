@@ -6,8 +6,8 @@ Each question is answered independently — the visible chat history is for
 reading back, not model memory. A question flows through
 ``services.answer.answer_routed`` (scope-gate/split → retrieve → grounded
 prompt → generate) and renders with its citations. Every question, answer,
-router verdict, and thumbs rating is logged to Postgres (``app`` schema)
-for the monitoring dashboard.
+router verdict, model cost, and thumbs rating is logged to Postgres
+(``app`` schema) for the monitoring dashboard.
 
 Abuse limits for a public demo: question length is capped, each session has
 a question budget, a database-backed daily ceiling covers all visitors, and
@@ -115,13 +115,17 @@ def _conversation_id() -> uuid.UUID:
 
 def _log_message(question: str, ans: Answer, error: str | None) -> int | None:
     """Record the exchange for monitoring. Never breaks the chat on failure."""
+    # Which model answered and what it cost. Absent when no answer was
+    # generated — a refused or failed question never reached a model.
+    usage = ans.usage
     try:
         row = _fetch_one(
             """
             INSERT INTO app.messages
                 (conversation_id, question, answer, route, retrieval_config,
-                 retrieved_chunks, latency_ms, error, router)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 retrieved_chunks, latency_ms, error, router,
+                 provider, model, prompt_tokens, completion_tokens, cached)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -139,6 +143,11 @@ def _log_message(question: str, ans: Answer, error: str | None) -> int | None:
                 ans.latency_ms,
                 error,
                 Jsonb(ans.router) if ans.router else None,
+                usage.provider if usage else None,
+                usage.model if usage else None,
+                usage.prompt_tokens if usage else None,
+                usage.completion_tokens if usage else None,
+                usage.cached if usage else None,
             ),
         )
         return row[0]
@@ -203,6 +212,20 @@ def _save_feedback(message_id: int, widget_key: str) -> None:
 
 # --- Answering -------------------------------------------------------------
 
+# Display names for the providers in the fallback chain. Which one answers
+# is decided at request time, so the answer names the model that actually
+# served it rather than a configured default.
+PROVIDER_LABELS = {"gemini": "Gemini", "groq": "Groq", "openai": "OpenAI"}
+
+
+def _model_note(usage) -> str | None:
+    """Attribution line for an answer, or None when no model was called
+    (refusals and errors never reach one)."""
+    if usage is None:
+        return None
+    provider = PROVIDER_LABELS.get(usage.provider, usage.provider.title())
+    return f"Generated with {usage.model} ({provider})"
+
 
 def _answer_and_log(question: str) -> dict:
     """Run the pipeline, log the exchange, return a renderable entry."""
@@ -237,6 +260,7 @@ def _answer_and_log(question: str) -> dict:
             for h in ans.hits
         ],
         "message_id": _log_message(question, ans, error),
+        "model_note": _model_note(ans.usage),
         # Executable flows get a sandbox offer; concept questions stay
         # answer-only. Matching is a whitelist, never model-driven.
         "sandbox_flow": match_flow(question) if ans.route == "docs" else None,
@@ -278,6 +302,8 @@ def _render_answer(entry: dict) -> None:
             trace = st.session_state.get(trace_key)
             if trace:
                 _render_trace(trace)
+    if entry.get("model_note"):
+        st.caption(entry["model_note"])
     if entry.get("message_id"):
         key = f"feedback_{entry['message_id']}"
         st.feedback(

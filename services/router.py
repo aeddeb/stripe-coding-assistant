@@ -26,7 +26,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from services.llm import chat
+from services.llm import complete
 
 LOGGER = logging.getLogger(__name__)
 
@@ -76,6 +76,10 @@ class Route:
     sub_questions: list[str] = field(default_factory=list)
     reason: str = ""
     error: str | None = None  # set when the router call failed (fail-open)
+    # Provider, model, and token counts for the routing call itself. Every
+    # question costs two model calls — this one and the answer — so the
+    # monitoring dashboard needs both to report real spend.
+    usage: dict | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -83,6 +87,7 @@ class Route:
             "sub_questions": self.sub_questions,
             "reason": self.reason,
             "error": self.error,
+            "usage": self.usage,
         }
 
 
@@ -90,14 +95,14 @@ def route_question(question: str) -> Route:
     """Classify and rewrite ``question``. Never raises: on any failure the
     question passes through unrouted (fail-open)."""
     try:
-        raw = chat(
+        response = complete(
             [
                 {"role": "system", "content": ROUTER_PROMPT},
                 {"role": "user", "content": question},
             ],
             temperature=0.0,
         )
-        data = json.loads(_strip_fences(raw))
+        data = json.loads(_strip_fences(response.text))
         in_scope = bool(data.get("in_scope"))
         subs = [
             s.strip()
@@ -106,7 +111,12 @@ def route_question(question: str) -> Route:
         ][:MAX_SUB_QUESTIONS]
         if in_scope and not subs:
             subs = [question]  # scope ok but no rewrite returned — use as-is
-        return Route(in_scope, subs, str(data.get("reason", "")))
+        return Route(
+            in_scope,
+            subs,
+            str(data.get("reason", "")),
+            usage=response.as_dict(),
+        )
     except Exception as exc:
         LOGGER.exception("router failed — passing question through")
         return Route(True, [question], "router error, fail-open", error=str(exc))

@@ -99,7 +99,7 @@ def evaluate_question(question: Question, hits: list[Hit]) -> dict[str, dict]:
     context = _context_for_judge(hits)
     results: dict[str, dict] = {}
     for variant, system_prompt in PROMPT_VARIANTS.items():
-        answer = generate_answer(question.question, hits, system_prompt)
+        answer = generate_answer(question.question, hits, system_prompt).text
         verdict = judge(question.question, context, answer)
         results[variant] = {
             "scores": verdict,
