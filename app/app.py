@@ -355,32 +355,37 @@ question = st.chat_input(
 )
 
 if question:
+    # Cheap, local checks first — they cost nothing and can run before the
+    # question is echoed.
     asked = sum(1 for e in st.session_state.history if e["role"] == "user")
     if asked >= MAX_QUESTIONS_PER_SESSION:
         st.warning("This session has hit its question limit — refresh the page to start fresh.")
-        st.stop()
-    if _daily_capped():
-        st.warning(
-            "The demo has answered its daily budget of questions — "
-            "please come back tomorrow."
-        )
-        st.stop()
-    if _burst_capped():
-        st.warning("The demo is getting a burst of traffic — try again in a minute.")
         st.stop()
     wait = _cooldown_remaining()
     if wait:
         st.info(f"One at a time — you can ask again in {wait}s.")
         st.stop()
-    st.session_state.last_question_at = time.monotonic()
 
     question = SECRET_PATTERN.sub("[redacted key]", question).strip()
-    st.session_state.history.append({"role": "user", "text": question})
+    # Echo the question immediately. The rate-limit checks below query the
+    # database — against a remote DB that round-trip is a visible pause, and
+    # an unechoed question reads as "nothing happened".
     with st.chat_message("user"):
         st.markdown(question)
 
     with st.chat_message("assistant"):
         with st.spinner("Searching the Stripe docs…"):
+            if _daily_capped():
+                st.warning(
+                    "The demo has answered its daily budget of questions — "
+                    "please come back tomorrow."
+                )
+                st.stop()
+            if _burst_capped():
+                st.warning("The demo is getting a burst of traffic — try again in a minute.")
+                st.stop()
+            st.session_state.last_question_at = time.monotonic()
             entry = _answer_and_log(question)
         _render_answer(entry)
+    st.session_state.history.append({"role": "user", "text": question})
     st.session_state.history.append(entry)
