@@ -114,27 +114,49 @@ Reproduce with `make llm-eval`. Every LLM call is disk-cached (`data/llm_cache/`
 
 ## Stripe Sandbox
 
-This is the differentiating feature: for executable flows, the assistant does not just cite the docs, it runs the recommendation against Stripe's test-mode sandbox and shows the receipt.
+This is the differentiating feature: for executable topics, the assistant does not just cite the docs, it runs the recommendation against Stripe's test-mode sandbox and shows the receipt.
 
-Ask *"charge $50 but hold the money until I ship"* and the answer arrives with a **Stripe Sandbox** section that shows the exact API payloads it will send. One click executes the flow with real API calls (no real money):
+Ask *"how do I refund a customer?"* and the answer arrives with a **Stripe Sandbox** section showing the exact API payloads it will send. One click executes the flow with real API calls (no real money):
 
-1. `PaymentIntent.create` (manual capture, confirmed with Stripe's test Visa) → status `requires_capture` — the hold is placed
-2. `PaymentIntent.capture` → status `succeeded` — the funds move
+1. `PaymentIntent.create` (confirmed with Stripe's test Visa) → status `succeeded` — the customer is charged
+2. `Refund.create` → status `succeeded` — the money goes back
 
-It then shows each call's full API response and the events Stripe recorded for the flow, in lifecycle order (`payment_intent.created` → ... → `payment_intent.succeeded`) — exactly what a webhook endpoint would have received. This makes the asynchronous part of payments, where most integration bugs hide, visible.
+It then shows each call's full API response, and the events Stripe recorded, in lifecycle order (`payment_intent.created` → `charge.succeeded` → `payment_intent.succeeded` → `charge.refunded` → `refund.created`) — exactly what a webhook endpoint would have received. This makes the asynchronous part of payments, where most integration bugs hide, visible.
 
-Safety is structural, not behavioral:
+### The eight flows
+
+| Flow | What it demonstrates |
+|---|---|
+| `payment_and_refund` | Charging a card and refunding it, in full or partially |
+| `hold_and_capture` | Authorising now, capturing when the order ships |
+| `hold_and_release` | Cancelling an authorisation — and why that is not a refund |
+| `subscription_lifecycle` | Creating a subscription, then cancelling at period end |
+| `subscription_change_price` | Upgrading a subscriber mid-cycle, with proration |
+| `checkout_session` | Creating a hosted Checkout page and returning its URL |
+| `save_card_off_session` | Saving a card with a SetupIntent, charging it later |
+| `declined_card` | Declines, insufficient funds, and 3D Secure |
+
+Topics outside this list say so, rather than silently showing nothing.
+
+### How a flow is chosen
+
+The router — the same cheap classification call that already gates scope and rewrites the question for retrieval — picks a flow key from the whitelist, or `null` when none fits. It costs no extra API call.
+
+Safety is structural, not behavioural:
 
 - **Test mode only** — execution refuses any key that is not `sk_test_...`.
-- **Whitelisted flows** — a question can only trigger a vetted, hardcoded call sequence (`agent/sandbox.py`). Model output never constructs API calls.
+- **Whitelisted flows** — a question can only trigger a vetted, hardcoded call sequence (`agent/sandbox.py`). Model output never constructs an API call.
+- **Numbers and fixed choices only** — the model may fill a flow's parameters (an amount, which decline to simulate), and each one is clamped to a safe range before use. No text the model wrote is ever sent to the Stripe API. The worst a hostile instruction hidden in a retrieved document can achieve is a different vetted flow at a different dollar amount.
+- **Preview equals execution** — the planned payloads and the executed ones are built by the same function, so what you approve is what runs.
 
-Try it standalone: `uv run --env-file .env python -m agent.sandbox`
+Try a flow standalone: `uv run --env-file .env python -m agent.sandbox payment_and_refund`
 
 ## Monitoring
 
-Every exchange is logged to Postgres, and every answer takes 👍/👎 feedback in the UI. A provisioned Grafana instance (started by `make up`, at `localhost:3000`, read-only DB role) ships with a dashboard grouped into three sections, each answering one question:
+Every exchange is logged to Postgres, and every answer takes 👍/👎 feedback in the UI. A provisioned Grafana instance (started by `make up`, at `localhost:3000`, read-only DB role) ships with a dashboard grouped into four sections, each answering one question:
 
 - **Usage** — is anyone using it, and what are they asking? Questions per hour, outcomes stacked per day (green answered, amber refused, red failed) so an outage reads as the day it happened rather than a permanent-looking total, and a live table of the last 25 questions with the model behind each answer.
+- **Sandbox** — how often can an answer prove itself? The share of answered questions that came with a runnable demo, the daily split between answers that had one and answers that did not, and which flows people's questions ask for. The second number is the useful one: the gap is the demand the eight flows do not cover yet, and the flow table says what to build ninth.
 - **Cost** — API calls per day, token spend per day, and which provider answered.
 - **Quality & speed** — answer time including the slow tail, how well the documentation search matched the question, and every answer a visitor rated, worst first.
 
@@ -168,6 +190,15 @@ The live demo runs on free tiers:
 - **Database** — [Neon](https://neon.tech) serverless Postgres with pgvector, loaded with the same corpus as local. The app connects through `DATABASE_URL` when it is set, so the same code serves both environments.
 - **Secrets** — kept in Streamlit's secrets manager, not in the repo.
 
+Nothing applies the schema automatically — there is no CI job, and the host deploys application code only. Both databases are updated with the same idempotent file, through the target that can reach them:
+
+```bash
+make schema                                              # local docker
+DATABASE_URL='<neon connection string>' make schema-cloud   # cloud
+```
+
+Run `schema-cloud` **before** deploying code that depends on a schema change, since the host redeploys on push. `schema-cloud` refuses to run without an explicit `DATABASE_URL` rather than falling back to the local database, so a forgotten variable cannot quietly rewrite the wrong one.
+
 The local Grafana can read the cloud database too, which is how the dashboard shows real visitor traffic. Create the read-only role on it once:
 
 ```bash
@@ -180,7 +211,8 @@ Then set `NEON_DB_HOST`, `NEON_DB_NAME`, and `NEON_GRAFANA_DB_PASSWORD` in `.env
 
 ## Next steps
 
-- More sandbox flows (refunds, subscriptions with trials) — the flow registry is built to take them.
+- **More sandbox flows.** These are verified to run headlessly against test mode and would slot straight into the registry: applying a coupon to a subscription, creating and finalising an invoice, opening a dispute with a test card, and replaying an idempotency key to show the same response returned twice.
+- **Connect flows** (splitting a payment with a connected account) — needs a Connect-enabled account before the API will create one.
 - Scheduled re-ingestion so the corpus tracks doc changes automatically.
 - A cost analysis of serving on paid tiers.
 

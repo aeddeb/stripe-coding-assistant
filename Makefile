@@ -5,7 +5,7 @@ POSTGRES_USER ?= app
 POSTGRES_DB   ?= stripe_assistant
 RUN = uv run --env-file .env
 
-.PHONY: up down schema model ingest chunk embed corpus experiments app psql
+.PHONY: up down schema schema-cloud model ingest chunk embed corpus experiments app psql
 
 up:            ## start postgres (and future services)
 	docker compose up -d
@@ -13,9 +13,16 @@ up:            ## start postgres (and future services)
 down:
 	docker compose down
 
-schema: up     ## apply db/schema.sql + read-only Grafana role (idempotent)
+schema: up     ## apply db/schema.sql + read-only Grafana role to local docker (idempotent)
 	docker compose exec -T postgres psql -U $(POSTGRES_USER) -d $(POSTGRES_DB) < db/schema.sql
 	$(RUN) python -m db.grafana_role
+
+schema-cloud:  ## apply db/schema.sql to DATABASE_URL, e.g. DATABASE_URL='postgresql://...' make schema-cloud
+	@test -n "$(DATABASE_URL)" || { \
+		echo "DATABASE_URL is not set. Give the cloud connection string explicitly:"; \
+		echo "    DATABASE_URL='postgresql://...' make schema-cloud"; \
+		exit 1; }
+	@DATABASE_URL='$(DATABASE_URL)' $(RUN) python -m db.apply_schema
 
 model:         ## download the ONNX embedding model (~90 MB, once)
 	$(RUN) python -m services.embedder

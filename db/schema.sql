@@ -101,12 +101,19 @@ CREATE TABLE IF NOT EXISTS app.messages (
     error            text,           -- exception text when route = 'error'
     -- Router verdict for this question: scope decision, rewritten
     -- sub-questions, and whether the router call itself failed (fail-open).
-    router           jsonb
+    router           jsonb,
+    -- Which sandbox flow was offered with this answer, NULL when none was.
+    -- The key rather than a flag, so one column answers both "how often is
+    -- a runnable demo offered" and "which demos do questions ask for".
+    -- Records what the user was actually shown, which is the router's
+    -- choice except when the router failed and keyword matching stood in.
+    sandbox_flow     text
 );
 
 -- Migrations for databases created before these columns existed.
 ALTER TABLE app.messages ADD COLUMN IF NOT EXISTS router jsonb;
 ALTER TABLE app.messages ADD COLUMN IF NOT EXISTS cached boolean;
+ALTER TABLE app.messages ADD COLUMN IF NOT EXISTS sandbox_flow text;
 
 CREATE INDEX IF NOT EXISTS messages_asked_at_idx
     ON app.messages (asked_at);

@@ -193,6 +193,213 @@
       "description": "One row per user question. `model` is the model that wrote the answer; `tokens` is that answer call only. A blank model means no model ran \u2014 the question was refused, errored, or the answer came from the cache."
     },
     {
+      "id": 103,
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "title": "Sandbox \u2014 how often an answer can prove itself",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      }
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Answers offering a runnable demo",
+      "datasource": {
+        "type": "postgres",
+        "uid": "${ds}"
+      },
+      "description": "Share of answered questions that came with a Stripe Sandbox section. Only questions answered from the docs are counted \u2014 a refused question has nothing to demonstrate. This is a coverage measure: a low number means the eight whitelisted flows do not cover what people are asking, not that anything is broken.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 19
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT round(100.0 * count(*) FILTER (WHERE sandbox_flow IS NOT NULL) / NULLIF(count(*), 0), 1) AS value FROM app.messages WHERE $__timeFilter(asked_at) AND route = 'docs'",
+          "datasource": {
+            "type": "postgres",
+            "uid": "${ds}"
+          }
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 20
+              },
+              {
+                "color": "green",
+                "value": 40
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Demo offered vs answer only",
+      "datasource": {
+        "type": "postgres",
+        "uid": "${ds}"
+      },
+      "description": "One stacked bar per day over questions answered from the docs. Green = the answer included a runnable sandbox flow. Grey = text and citations only, because no whitelisted flow fits the topic. The grey band is the backlog: it shows how much demand the current eight flows miss.",
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 6,
+        "y": 19
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroup(asked_at, '1d', 0) AS time, CASE WHEN sandbox_flow IS NOT NULL THEN 'Runnable demo offered' ELSE 'Answer only' END AS metric, count(*) AS value FROM app.messages WHERE $__timeFilter(asked_at) AND route = 'docs' GROUP BY 1, 2 ORDER BY 1",
+          "datasource": {
+            "type": "postgres",
+            "uid": "${ds}"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 85,
+            "lineWidth": 0,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Runnable demo offered"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Answer only"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "text"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 13,
+      "type": "table",
+      "title": "Which demos questions ask for",
+      "datasource": {
+        "type": "postgres",
+        "uid": "${ds}"
+      },
+      "description": "Every sandbox flow offered in the window, most-requested first. This is the list to read before building a ninth flow: it says which topics people actually bring, and a flow that never appears is one the router is not finding a use for.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 19
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT sandbox_flow AS \"Flow\", count(*) AS \"Times offered\" FROM app.messages WHERE $__timeFilter(asked_at) AND sandbox_flow IS NOT NULL GROUP BY 1 ORDER BY 2 DESC",
+          "datasource": {
+            "type": "postgres",
+            "uid": "${ds}"
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Times offered",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
       "id": 101,
       "type": "row",
       "title": "Cost \u2014 what the model providers are being asked to do",
@@ -201,7 +408,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 27
       },
       "panels": []
     },
@@ -218,7 +425,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 19
+        "y": 28
       },
       "targets": [
         {
@@ -260,7 +467,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 19
+        "y": 28
       },
       "targets": [
         {
@@ -302,7 +509,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 19
+        "y": 28
       },
       "targets": [
         {
@@ -339,7 +546,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 27
+        "y": 36
       },
       "panels": []
     },
@@ -355,7 +562,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 28
+        "y": 37
       },
       "targets": [
         {
@@ -390,7 +597,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 28
+        "y": 37
       },
       "targets": [
         {
@@ -426,7 +633,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 36
+        "y": 45
       },
       "targets": [
         {

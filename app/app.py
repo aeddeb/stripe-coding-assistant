@@ -35,7 +35,15 @@ import streamlit as st
 from psycopg.types.json import Jsonb
 
 from services import db
-from agent.sandbox import FLOWS, SandboxTrace, match_flow, preview_flow, run_flow
+from agent.sandbox import (
+    FLOWS,
+    SandboxTrace,
+    coerce_params,
+    flow_catalog,
+    match_flow,
+    preview_flow,
+    run_flow,
+)
 from services.answer import (
     CODE_LANGUAGES,
     PROMPT_VARIANTS,
@@ -113,19 +121,23 @@ def _conversation_id() -> uuid.UUID:
     return st.session_state.conversation_id
 
 
-def _log_message(question: str, ans: Answer, error: str | None) -> int | None:
+def _log_message(
+    question: str, ans: Answer, error: str | None, sandbox_flow: str | None
+) -> int | None:
     """Record the exchange for monitoring. Never breaks the chat on failure."""
-    # Which model answered and what it cost. Absent when no answer was
-    # generated — a refused or failed question never reached a model.
-    usage = ans.usage
     try:
+        # Which model answered and what it cost. Absent when no answer was
+        # generated — a refused or failed question never reached a model.
+        usage = ans.usage
         row = _fetch_one(
             """
             INSERT INTO app.messages
                 (conversation_id, question, answer, route, retrieval_config,
                  retrieved_chunks, latency_ms, error, router,
-                 provider, model, prompt_tokens, completion_tokens, cached)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 provider, model, prompt_tokens, completion_tokens, cached,
+                 sandbox_flow)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s)
             RETURNING id
             """,
             (
@@ -148,6 +160,7 @@ def _log_message(question: str, ans: Answer, error: str | None) -> int | None:
                 usage.prompt_tokens if usage else None,
                 usage.completion_tokens if usage else None,
                 usage.cached if usage else None,
+                sandbox_flow,
             ),
         )
         return row[0]
@@ -236,7 +249,8 @@ def _answer_and_log(question: str) -> dict:
     try:
         with db.connect() as conn:
             ans = answer_routed(
-                question, SERVING_CONFIG, conn, system_prompt=prompt
+                question, SERVING_CONFIG, conn, system_prompt=prompt,
+                sandbox_flows=flow_catalog(),
             )
     except Exception as exc:
         LOGGER.exception("answer pipeline failed")
@@ -247,6 +261,9 @@ def _answer_and_log(question: str) -> dict:
             hits=[],
             latency_ms=0,
         )
+    # Decided once: the same value is logged for monitoring and rendered
+    # in the UI, so the dashboard cannot disagree with what users saw.
+    sandbox_flow = _sandbox_choice(question, ans)
     return {
         "role": "assistant",
         "text": ans.text,
@@ -259,12 +276,33 @@ def _answer_and_log(question: str) -> dict:
             }
             for h in ans.hits
         ],
-        "message_id": _log_message(question, ans, error),
+        "message_id": _log_message(question, ans, error, sandbox_flow),
         "model_note": _model_note(ans.usage),
-        # Executable flows get a sandbox offer; concept questions stay
-        # answer-only. Matching is a whitelist, never model-driven.
-        "sandbox_flow": match_flow(question) if ans.route == "docs" else None,
+        # Which runnable demonstration to offer. The router chooses from a
+        # fixed whitelist; the model can pick a flow but never write one.
+        "sandbox_flow": sandbox_flow,
+        "sandbox_params": ans.sandbox_params,
+        # A stable key for this answer's widgets. Streamlit keys must be
+        # unique per widget, and message_id is None whenever the monitoring
+        # write failed — two such answers would collide on a shared key.
+        "widget_key": uuid.uuid4().hex[:8],
     }
+
+
+def _sandbox_choice(question: str, ans: Answer) -> str | None:
+    """The flow to offer for this answer, or None.
+
+    Normally the router picks it. If the router call itself failed, the
+    question still got answered (the pipeline fails open) — fall back to
+    keyword matching so an outage does not silently remove the sandbox.
+    """
+    if ans.route != "docs":
+        return None
+    if ans.sandbox_flow:
+        return ans.sandbox_flow
+    if (ans.router or {}).get("error"):
+        return match_flow(question)
+    return None
 
 
 # --- Rendering -------------------------------------------------------------
@@ -280,28 +318,7 @@ def _render_answer(entry: dict) -> None:
                 if c.get("heading_path"):
                     line += f" — {c['heading_path']}"
                 st.markdown(line)
-    flow_key = entry.get("sandbox_flow")
-    if flow_key:
-        entry_key = entry.get("message_id") or "draft"
-        with st.expander("🧪 Stripe Sandbox — run the sample code in Stripe Test Mode"):
-            st.caption(
-                "This executes the recommended flow "
-                f"(**{FLOWS[flow_key]['label']}**) against Stripe's test-mode "
-                "sandbox — real API calls, no real money. The payloads below "
-                "are exactly what will be sent."
-            )
-            for i, planned in enumerate(preview_flow(flow_key), start=1):
-                st.markdown(f"**{i}. `{planned['call']}`** — {planned['note']}")
-                st.json(planned["request"], expanded=True)
-            trace_key = f"sandbox_trace_{entry_key}"
-            if st.button(
-                "▶ Run it", key=f"sandbox_btn_{entry_key}"
-            ) and trace_key not in st.session_state:
-                with st.spinner("Executing against Stripe test mode…"):
-                    st.session_state[trace_key] = run_flow(flow_key)
-            trace = st.session_state.get(trace_key)
-            if trace:
-                _render_trace(trace)
+    _render_sandbox(entry)
     if entry.get("model_note"):
         st.caption(entry["model_note"])
     if entry.get("message_id"):
@@ -309,6 +326,49 @@ def _render_answer(entry: dict) -> None:
         st.feedback(
             "thumbs", key=key, on_change=_save_feedback, args=(entry["message_id"], key)
         )
+
+
+def _render_sandbox(entry: dict) -> None:
+    """The sandbox offer for one answer, or a line saying why there isn't one.
+
+    Saying nothing was the old behaviour, and it read as a bug: a question
+    the sandbox cannot demonstrate looked identical to one it had failed on.
+    """
+    if entry.get("route") != "docs":
+        return
+    flow_key = entry.get("sandbox_flow")
+    if not flow_key:
+        st.caption("No runnable sandbox demo covers this topic yet.")
+        return
+
+    flow = FLOWS[flow_key]
+    params = coerce_params(flow_key, entry.get("sandbox_params"))
+    widget_key = entry.get("widget_key") or entry.get("message_id") or "draft"
+    trace_key = f"sandbox_trace_{widget_key}"
+
+    with st.expander("🧪 Stripe Sandbox — run this against Stripe Test Mode"):
+        st.caption(
+            f"This executes **{flow.label}** against Stripe's test-mode "
+            "sandbox — real API calls, no real money. The payloads below are "
+            "exactly what will be sent."
+        )
+        if params:
+            st.caption(
+                "Running with "
+                + ", ".join(
+                    f"{flow.params[name].label.lower()} **{value}**"
+                    for name, value in params.items()
+                )
+            )
+        for i, planned in enumerate(preview_flow(flow_key, params), start=1):
+            st.markdown(f"**{i}. `{planned['call']}`** — {planned['note']}")
+            st.json(planned["request"], expanded=False)
+        if st.button("▶ Run it", key=f"sandbox_btn_{widget_key}"):
+            with st.spinner("Executing against Stripe test mode…"):
+                st.session_state[trace_key] = run_flow(flow_key, params)
+        trace = st.session_state.get(trace_key)
+        if trace:
+            _render_trace(trace)
 
 
 def _render_trace(trace: SandboxTrace) -> None:
@@ -319,11 +379,20 @@ def _render_trace(trace: SandboxTrace) -> None:
     # the trace shows what came back for each call.
     st.markdown(f"**{trace.title}** — executed:")
     for i, step in enumerate(trace.steps, start=1):
+        # A decline is the point of its flow, not a malfunction — mark it as
+        # a result, with the error Stripe returned as the response body.
+        arrow = "✕" if step.failed else "→"
+        target = f" `{step.object_id}`" if step.object_id else ""
         st.markdown(
-            f"**{i}. `{step.call}`** → `{step.object_id}` — "
+            f"**{i}. `{step.call}`** {arrow}{target} — "
             f"status **`{step.status}`**, {step.note}"
         )
-        st.caption("Response returned (null fields omitted)")
+        if step.link:
+            st.markdown(f"[Open the Checkout page ↗]({step.link})")
+        st.caption(
+            "Error Stripe returned" if step.failed
+            else "Response returned (null fields omitted)"
+        )
         st.json(step.response, expanded=False)
     if trace.events:
         st.markdown("**Events Stripe recorded** (what your webhook would receive):")

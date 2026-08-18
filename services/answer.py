@@ -179,6 +179,10 @@ class Answer:
     latency_ms: int
     router: dict | None = None      # router verdict, for monitoring
     skipped: list[str] = field(default_factory=list)  # parts with no coverage
+    # The sandbox flow the router chose for this question, and the
+    # parameters it supplied. None when no runnable flow fits.
+    sandbox_flow: str | None = None
+    sandbox_params: dict = field(default_factory=dict)
     # Which provider and model generated the answer, and what it cost.
     # None when no answer was generated (a refusal costs nothing).
     usage: Completion | None = None
@@ -262,16 +266,22 @@ def answer_routed(
     cfg: RetrievalConfig,
     conn: psycopg.Connection,
     system_prompt: str = SYSTEM_PROMPT,
+    sandbox_flows: list[dict] | None = None,
 ) -> Answer:
-    """The full serving pipeline: route (scope-gate + split + rewrite),
-    retrieve per sub-question, merge, generate one answer.
+    """The full serving pipeline: route (scope-gate + split + rewrite +
+    sandbox choice), retrieve per sub-question, merge, generate one answer.
+
+    ``sandbox_flows`` is the sandbox whitelist to offer the router, passed
+    straight through. It is a parameter rather than an import so the answer
+    pipeline stays independent of the sandbox — evaluations call this with
+    no flows at all.
 
     ``answer_question`` above stays router-free on purpose — evaluations
     measure retrieval and generation in isolation; this wrapper is the
     user-facing composition.
     """
     start = time.perf_counter()
-    route = route_question(question)
+    route = route_question(question, sandbox_flows)
     if not route.in_scope:
         return Answer(
             GATE_REFUSAL_TEXT, "refused", [], _elapsed_ms(start),
@@ -302,6 +312,7 @@ def answer_routed(
     return Answer(
         text, "docs", hits, _elapsed_ms(start),
         router=route.as_dict(), skipped=skipped, usage=generated,
+        sandbox_flow=route.sandbox_flow, sandbox_params=route.sandbox_params,
     )
 
 
