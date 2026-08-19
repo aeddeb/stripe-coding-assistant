@@ -107,13 +107,18 @@ CREATE TABLE IF NOT EXISTS app.messages (
     -- a runnable demo offered" and "which demos do questions ask for".
     -- Records what the user was actually shown, which is the router's
     -- choice except when the router failed and keyword matching stood in.
-    sandbox_flow     text
+    sandbox_flow     text,
+    -- Which code language the sidebar selector was set to when the question
+    -- was asked, so the dashboard can see whether it is used and which
+    -- languages matter. NULL for rows written before it was logged.
+    code_language    text
 );
 
 -- Migrations for databases created before these columns existed.
 ALTER TABLE app.messages ADD COLUMN IF NOT EXISTS router jsonb;
 ALTER TABLE app.messages ADD COLUMN IF NOT EXISTS cached boolean;
 ALTER TABLE app.messages ADD COLUMN IF NOT EXISTS sandbox_flow text;
+ALTER TABLE app.messages ADD COLUMN IF NOT EXISTS code_language text;
 
 CREATE INDEX IF NOT EXISTS messages_asked_at_idx
     ON app.messages (asked_at);

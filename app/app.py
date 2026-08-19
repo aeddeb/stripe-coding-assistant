@@ -23,6 +23,7 @@ import re
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 
@@ -46,6 +47,7 @@ from agent.sandbox import (
 )
 from services.answer import (
     CODE_LANGUAGES,
+    FORMATTING_INSTRUCTION,
     PROMPT_VARIANTS,
     Answer,
     answer_routed,
@@ -82,11 +84,32 @@ MAX_QUESTIONS_PER_MINUTE = int(os.getenv("MAX_QUESTIONS_PER_MINUTE", "10"))
 # Per-session pacing: minimum seconds between two questions from one tab.
 QUESTION_COOLDOWN_SECONDS = int(os.getenv("QUESTION_COOLDOWN_SECONDS", "5"))
 
+# Chosen to show what this assistant does that a generic chatbot does not:
+# the first offers a runnable sandbox demonstration, the second is split by
+# the router into two retrievals, the third lands on the asynchronous part
+# of an integration where copy-pasted answers usually fail.
 EXAMPLE_QUESTIONS = [
-    "How do I charge a customer $50 but only capture the money when I ship?",
-    "What's the difference between Checkout and Payment Links?",
-    "How should I handle the checkout.session.completed webhook?",
+    "How do I place a hold on a customer's card and only capture it when I ship?",
+    "What's the difference between Checkout and Payment Links, and which "
+    "one should I use for a one-off invoice?",
+    "How do I make sure I never fulfill an order twice when handling "
+    "checkout.session.completed?",
 ]
+
+# What the progress line says while each pipeline stage runs. The pipeline
+# reports stage keys and the wording lives here, in the UI.
+STAGE_LABELS = {
+    "routing": "Understanding the question…",
+    "retrieval": "Searching the Stripe docs…",
+    "generation": "Writing a grounded answer…",
+}
+
+# What "this answer contains code" looks like: a fenced block. Inline
+# backticks are not enough — a Dashboard walkthrough is full of them, and
+# naming `capture_method` mid-sentence is not something you can execute.
+# The leading spaces matter: answers put code inside numbered steps, so
+# almost every real fence is indented and an anchored ^``` matches none.
+CODE_FENCE = re.compile(r"^[ \t]*```", re.MULTILINE)
 
 # Stripe-style secrets (sk_test_..., pk_live_..., whsec_...). Users sometimes
 # paste real keys into chat bots; strip them before the question is logged,
@@ -135,9 +158,9 @@ def _log_message(
                 (conversation_id, question, answer, route, retrieval_config,
                  retrieved_chunks, latency_ms, error, router,
                  provider, model, prompt_tokens, completion_tokens, cached,
-                 sandbox_flow)
+                 sandbox_flow, code_language)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s)
+                    %s, %s)
             RETURNING id
             """,
             (
@@ -161,6 +184,9 @@ def _log_message(
                 usage.completion_tokens if usage else None,
                 usage.cached if usage else None,
                 sandbox_flow,
+                # Which language the answer's code samples were asked for,
+                # so the dashboard can see whether the selector is used.
+                st.session_state.get("code_language"),
             ),
         )
         return row[0]
@@ -240,17 +266,27 @@ def _model_note(usage) -> str | None:
     return f"Generated with {usage.model} ({provider})"
 
 
-def _answer_and_log(question: str) -> dict:
-    """Run the pipeline, log the exchange, return a renderable entry."""
+def _answer_and_log(
+    question: str, on_stage: Callable[[str], None] | None = None
+) -> dict:
+    """Run the pipeline, log the exchange, return a renderable entry.
+
+    ``on_stage`` is passed through to the pipeline, which calls it as each
+    stage starts so the progress line can name the stage running.
+    """
     error = None
-    prompt = SERVING_PROMPT + language_instruction(
-        st.session_state.get("code_language", CODE_LANGUAGES[0])
+    prompt = (
+        SERVING_PROMPT
+        + language_instruction(
+            st.session_state.get("code_language", CODE_LANGUAGES[0])
+        )
+        + FORMATTING_INSTRUCTION
     )
     try:
         with db.connect() as conn:
             ans = answer_routed(
                 question, SERVING_CONFIG, conn, system_prompt=prompt,
-                sandbox_flows=flow_catalog(),
+                sandbox_flows=flow_catalog(), on_stage=on_stage,
             )
     except Exception as exc:
         LOGGER.exception("answer pipeline failed")
@@ -261,6 +297,15 @@ def _answer_and_log(question: str) -> dict:
             hits=[],
             latency_ms=0,
         )
+    # The frozen v3 prompt names the second section "Code sample" and
+    # instructs that the structure be followed exactly, so an answer built
+    # from Dashboard pages still files its click-steps under a heading that
+    # promises code. No addendum wording reliably talks it out of that.
+    # Whether code is present is mechanically decidable, so it is decided
+    # here instead of asked twice — and from the same signal that gates the
+    # sandbox, so the heading and the sandbox can never disagree.
+    if not _has_code(ans.text):
+        ans.text = ans.text.replace("**Code sample**", "**Steps**")
     # Decided once: the same value is logged for monitoring and rendered
     # in the UI, so the dashboard cannot disagree with what users saw.
     sandbox_flow = _sandbox_choice(question, ans)
@@ -289,14 +334,27 @@ def _answer_and_log(question: str) -> dict:
     }
 
 
+def _has_code(text: str) -> bool:
+    """Whether an answer actually shows code the sandbox could stand in for."""
+    return bool(CODE_FENCE.search(text or ""))
+
+
 def _sandbox_choice(question: str, ans: Answer) -> str | None:
     """The flow to offer for this answer, or None.
 
     Normally the router picks it. If the router call itself failed, the
     question still got answered (the pipeline fails open) — fall back to
     keyword matching so an outage does not silently remove the sandbox.
+
+    The answer gets the last word. The router chooses from the question
+    alone, before any answer exists, so it cannot know the docs would
+    answer with a Dashboard walkthrough instead of code. Offering to
+    execute API calls under an answer that contains none demonstrates
+    something the user was never told to do.
     """
     if ans.route != "docs":
+        return None
+    if not _has_code(ans.text):
         return None
     if ans.sandbox_flow:
         return ans.sandbox_flow
@@ -308,21 +366,73 @@ def _sandbox_choice(question: str, ans: Answer) -> str | None:
 # --- Rendering -------------------------------------------------------------
 
 
-def _render_answer(entry: dict) -> None:
-    st.markdown(entry["text"])
+# Progressive rendering. Nothing streams out of the LLM — the answer is
+# complete before it reaches here — so this only paces text that already
+# exists, so a long answer fills in instead of landing as one wall. Quick
+# on purpose: roughly a second for a full-length answer.
+STREAM_WORDS_PER_CHUNK = 6
+STREAM_CHUNK_SECONDS = 0.012
+
+
+def _word_stream(text: str):
+    """Yield a finished answer in small bursts, for ``st.write_stream``."""
+    words = text.split(" ")
+    for i in range(0, len(words), STREAM_WORDS_PER_CHUNK):
+        yield " ".join(words[i : i + STREAM_WORDS_PER_CHUNK]) + " "
+        time.sleep(STREAM_CHUNK_SECONDS)
+
+
+def _group_citations(citations: list[dict]) -> list[dict]:
+    """One entry per source page, keeping every [n] that pointed at it.
+
+    Retrieval returns chunks, and a long documentation page usually supplies
+    several of them, so the raw list repeats the same page under different
+    numbers. The numbers are never reassigned: they are the markers the
+    answer text cites, and they have to keep pointing at the same excerpts.
+    """
+    grouped: dict[str, dict] = {}
+    for i, c in enumerate(citations, start=1):
+        page = grouped.setdefault(
+            c["page_url"],
+            {
+                "page_url": c["page_url"],
+                "page_title": c.get("page_title"),
+                "indices": [],
+                "headings": [],
+            },
+        )
+        page["indices"].append(i)
+        page["headings"].append(c.get("heading_path") or "")
+    return list(grouped.values())
+
+
+def _render_answer(entry: dict, stream: bool = False) -> None:
+    # Streamed only when the answer has just been generated; replaying the
+    # history renders instantly.
+    if stream:
+        st.write_stream(_word_stream(entry["text"]))
+    else:
+        st.markdown(entry["text"])
     citations = entry.get("citations") or []
     if citations:
-        with st.expander(f"Sources ({len(citations)})"):
-            for i, c in enumerate(citations, start=1):
-                line = f"**[{i}]** [{c['page_title'] or c['page_url']}]({c['page_url']})"
-                if c.get("heading_path"):
-                    line += f" — {c['heading_path']}"
+        pages = _group_citations(citations)
+        with st.expander(f"Sources ({len(pages)})"):
+            for page in pages:
+                markers = "".join(f"[{i}]" for i in page["indices"])
+                title = page["page_title"] or page["page_url"]
+                line = f"**{markers}** [{title}]({page['page_url']})"
+                # Named only when every excerpt from this page came from the
+                # same section — otherwise one heading would stand in for
+                # several and describe the others wrongly.
+                if len(set(page["headings"])) == 1 and page["headings"][0]:
+                    line += f" — {page['headings'][0]}"
                 st.markdown(line)
     _render_sandbox(entry)
     if entry.get("model_note"):
         st.caption(entry["model_note"])
     if entry.get("message_id"):
         key = f"feedback_{entry['message_id']}"
+        st.caption("Rate this answer — was it accurate and useful?")
         st.feedback(
             "thumbs", key=key, on_change=_save_feedback, args=(entry["message_id"], key)
         )
@@ -338,15 +448,31 @@ def _render_sandbox(entry: dict) -> None:
         return
     flow_key = entry.get("sandbox_flow")
     if not flow_key:
-        st.caption("No runnable sandbox demo covers this topic yet.")
+        st.caption(
+            "This answer doesn't include code to run, so there's nothing to "
+            "execute against the sandbox."
+            if not _has_code(entry.get("text", ""))
+            else "No runnable sandbox demo covers this topic yet."
+        )
         return
 
     flow = FLOWS[flow_key]
     params = coerce_params(flow_key, entry.get("sandbox_params"))
     widget_key = entry.get("widget_key") or entry.get("message_id") or "draft"
     trace_key = f"sandbox_trace_{widget_key}"
+    run_key = f"sandbox_btn_{widget_key}"
+    # Streamlit builds an expander closed unless told otherwise, and every
+    # click reruns the whole script — so the panel used to shut itself on
+    # exactly the rerun that produced the trace, hiding the result the user
+    # had just asked for. Both conditions are needed: on the run itself the
+    # trace does not exist yet, and the button's click is readable here
+    # because the rerun it triggers carries its value in session state.
+    just_ran = bool(st.session_state.get(run_key))
 
-    with st.expander("🧪 Stripe Sandbox — run this against Stripe Test Mode"):
+    with st.expander(
+        "🧪 Stripe Sandbox — run this against Stripe Test Mode",
+        expanded=just_ran or trace_key in st.session_state,
+    ):
         st.caption(
             f"This executes **{flow.label}** against Stripe's test-mode "
             "sandbox — real API calls, no real money. The payloads below are "
@@ -360,13 +486,22 @@ def _render_sandbox(entry: dict) -> None:
                     for name, value in params.items()
                 )
             )
-        for i, planned in enumerate(preview_flow(flow_key, params), start=1):
-            st.markdown(f"**{i}. `{planned['call']}`** — {planned['note']}")
-            st.json(planned["request"], expanded=False)
-        if st.button("▶ Run it", key=f"sandbox_btn_{widget_key}"):
+        # Written after the run button so a finished run can collapse the
+        # plan it has replaced; the container holds the slot up here.
+        plan_box = st.container()
+        if st.button("▶ Run it", key=run_key):
             with st.spinner("Executing against Stripe test mode…"):
                 st.session_state[trace_key] = run_flow(flow_key, params)
         trace = st.session_state.get(trace_key)
+        with plan_box:
+            for i, planned in enumerate(preview_flow(flow_key, params), start=1):
+                if trace:
+                    # The trace below shows each request beside what it
+                    # returned, so the payloads here would only repeat it.
+                    st.markdown(f"{i}. `{planned['call']}` — {planned['note']}")
+                else:
+                    st.markdown(f"**{i}. `{planned['call']}`** — {planned['note']}")
+                    st.json(planned["request"], expanded=False)
         if trace:
             _render_trace(trace)
 
@@ -375,8 +510,9 @@ def _render_trace(trace: SandboxTrace) -> None:
     if trace.error:
         st.error(trace.error)
         return
-    # The request payloads are already on screen (the pre-run preview), so
-    # the trace shows what came back for each call.
+    # Each step carries its own request, so the call is shown next to what
+    # it returned. The pre-run plan above collapses to one line per step
+    # once this exists, rather than repeating the payloads.
     st.markdown(f"**{trace.title}** — executed:")
     for i, step in enumerate(trace.steps, start=1):
         # A decline is the point of its flow, not a malfunction — mark it as
@@ -389,9 +525,11 @@ def _render_trace(trace: SandboxTrace) -> None:
         )
         if step.link:
             st.markdown(f"[Open the Checkout page ↗]({step.link})")
+        st.caption("Sent")
+        st.json(step.request, expanded=False)
         st.caption(
-            "Error Stripe returned" if step.failed
-            else "Response returned (null fields omitted)"
+            "Returned — the error Stripe replied with" if step.failed
+            else "Returned (null fields omitted)"
         )
         st.json(step.response, expanded=False)
     if trace.events:
@@ -405,12 +543,37 @@ def _render_trace(trace: SandboxTrace) -> None:
 
 # --- Page ------------------------------------------------------------------
 
-st.set_page_config(page_title="Stripe Coding Assistant", page_icon="💳")
-st.title("💳 Stripe Coding Assistant")
+st.set_page_config(page_title="Stripe Integration Assistant", page_icon="💳")
+st.title("💳 Stripe Integration Assistant")
 st.caption(
     "Ask how to build with Stripe. Answers come from the official docs, "
     "with citations you can check."
 )
+# Kept in the main column on purpose: Streamlit collapses the sidebar on
+# narrow screens, so a disclaimer down there is invisible to most visitors
+# arriving from a phone.
+st.caption(
+    "Answers are generated from Stripe's public documentation and can be "
+    "wrong or out of date — check the linked sources before relying on "
+    "them. Not affiliated with or endorsed by Stripe."
+)
+
+# Directly under the title, where a visitor arriving from a link looks
+# first — and where it explains the name above it. Collapsed, so it costs
+# one line above the conversation.
+with st.expander("About this project"):
+    st.markdown(
+        "Stripe's documentation is excellent but enormous, and it is "
+        "organized by product — so one integration question is usually "
+        "answered across several pages. Ask a general-purpose AI instead "
+        "and it fills the gaps with parameter names that look right but do "
+        "not exist.\n\n"
+        "This assistant answers only from the official Stripe docs, and "
+        "links the pages behind every claim so you can check it. When the "
+        "answer is a payment flow you can run, it proves the answer by "
+        "running that flow in Stripe's test sandbox and showing the real "
+        "API calls, responses, and webhook events."
+    )
 
 with st.sidebar:
     st.subheader("What can I ask?")
@@ -418,8 +581,12 @@ with st.sidebar:
         "Anything about **integrating Stripe**: payments, Checkout, "
         "webhooks, subscriptions, refunds, disputes, testing."
     )
-    for q in EXAMPLE_QUESTIONS:
-        st.markdown(f"- *{q}*")
+    st.caption("Try one of these:")
+    for i, q in enumerate(EXAMPLE_QUESTIONS):
+        # A chat_input cannot be prefilled, so an example is submitted
+        # directly — picked up below, where a typed question is read.
+        if st.button(q, key=f"example_{i}", use_container_width=True):
+            st.session_state.pending_question = q
     st.divider()
     st.selectbox(
         "Code samples in",
@@ -430,9 +597,18 @@ with st.sidebar:
     )
     st.divider()
     st.caption(
+        "Each question is answered on its own — answers don't carry "
+        "context from earlier questions."
+    )
+    st.caption(
         "Answers are generated from retrieved documentation and can be "
         "imperfect — sources are linked so you can verify. "
         "Don't paste API keys or personal data."
+    )
+    st.divider()
+    st.caption(
+        "Built by [Ali Eddeb](https://www.linkedin.com/in/ali-eddeb/) · "
+        "[Source on GitHub](https://github.com/aeddeb/stripe-coding-assistant)"
     )
 
 if "history" not in st.session_state:
@@ -448,6 +624,9 @@ for entry in st.session_state.history:
 question = st.chat_input(
     "Ask about integrating Stripe…", max_chars=MAX_QUESTION_CHARS
 )
+# An example button in the sidebar submits its question through here, so a
+# clicked example and a typed one follow exactly the same path.
+question = question or st.session_state.pop("pending_question", None)
 
 if question:
     # Cheap, local checks first — they cost nothing and can run before the
@@ -469,18 +648,31 @@ if question:
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching the Stripe docs…"):
-            if _daily_capped():
-                st.warning(
-                    "The demo has answered its daily budget of questions — "
-                    "please come back tomorrow."
-                )
-                st.stop()
-            if _burst_capped():
-                st.warning("The demo is getting a burst of traffic — try again in a minute.")
-                st.stop()
-            st.session_state.last_question_at = time.monotonic()
-            entry = _answer_and_log(question)
-        _render_answer(entry)
+        # The rate-limit checks are database round-trips, but they either
+        # stop the question or cost nothing to report — the progress line
+        # opens once the question is actually going to be answered.
+        if _daily_capped():
+            st.warning(
+                "The demo has answered its daily budget of questions — "
+                "please come back tomorrow."
+            )
+            st.stop()
+        if _burst_capped():
+            st.warning("The demo is getting a burst of traffic — try again in a minute.")
+            st.stop()
+        st.session_state.last_question_at = time.monotonic()
+        status = st.status(STAGE_LABELS["routing"], expanded=False)
+        entry = _answer_and_log(
+            question,
+            on_stage=lambda stage: status.update(
+                label=STAGE_LABELS.get(stage, stage)
+            ),
+        )
+        failed = entry["route"] == "error"
+        status.update(
+            label="Something went wrong" if failed else "Answered",
+            state="error" if failed else "complete",
+        )
+        _render_answer(entry, stream=True)
     st.session_state.history.append({"role": "user", "text": question})
     st.session_state.history.append(entry)

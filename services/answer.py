@@ -18,6 +18,7 @@ Scope and safety live in layers:
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from itertools import zip_longest
 
@@ -156,6 +157,26 @@ def language_instruction(language: str) -> str:
         "in prose alone.\n"
     )
 
+
+# Presentation addendum, appended to the serving prompt the same way the
+# language rules are. It refines how an answer reads — section title, first
+# section shape, which terms are emphasised — and deliberately leaves the
+# grounding, citation, and three-section structure of the variant prompts
+# untouched. Kept out of the variants themselves so the evaluated prompts
+# stay byte-identical to what was measured.
+FORMATTING_INSTRUCTION = (
+    "\nPresentation rules (these refine the section format above, they do "
+    "not replace it):\n"
+    "- Title the first section **Answer**, not **Summary**.\n"
+    "- Write the first section as 2-4 short bullet points when the "
+    "question has several moving pieces; keep it as a short paragraph when "
+    "a single thread answers it.\n"
+    "- Bold every Stripe object or product name the first time it appears, "
+    "for example **PaymentIntent**, **Checkout**, **Payment Links**.\n"
+    "- Keep API parameter names, field paths, and literal values in "
+    "backticks.\n"
+)
+
 REFUSAL_TEXT = """\
 I couldn't find anything relevant in the Stripe documentation for that, so
 I can't give you a grounded answer. I only answer questions about
@@ -267,6 +288,7 @@ def answer_routed(
     conn: psycopg.Connection,
     system_prompt: str = SYSTEM_PROMPT,
     sandbox_flows: list[dict] | None = None,
+    on_stage: Callable[[str], None] | None = None,
 ) -> Answer:
     """The full serving pipeline: route (scope-gate + split + rewrite +
     sandbox choice), retrieve per sub-question, merge, generate one answer.
@@ -276,11 +298,18 @@ def answer_routed(
     pipeline stays independent of the sandbox — evaluations call this with
     no flows at all.
 
+    ``on_stage`` is called as each stage begins, with one of the keys
+    ``"routing"``, ``"retrieval"``, or ``"generation"``. They are keys, not
+    display text: the caller owns the wording. It defaults to None, so the
+    CLI and the evaluations run exactly as before.
+
     ``answer_question`` above stays router-free on purpose — evaluations
     measure retrieval and generation in isolation; this wrapper is the
     user-facing composition.
     """
     start = time.perf_counter()
+    if on_stage:
+        on_stage("routing")
     route = route_question(question, sandbox_flows)
     if not route.in_scope:
         return Answer(
@@ -289,6 +318,8 @@ def answer_routed(
         )
 
     subs = route.sub_questions or [question]
+    if on_stage:
+        on_stage("retrieval")
     if len(subs) == 1:
         hits, skipped = search(subs[0], cfg, conn), []
     else:
@@ -299,6 +330,8 @@ def answer_routed(
             router=route.as_dict(),
         )
 
+    if on_stage:
+        on_stage("generation")
     generated = generate_answer(
         _question_block(question, subs), hits, system_prompt
     )
