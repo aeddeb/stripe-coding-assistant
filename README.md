@@ -1,4 +1,4 @@
-# Stripe Coding Assistant
+# Stripe Integration Assistant
 
 ### Author: [Ali Eddeb](https://www.linkedin.com/in/ali-eddeb/)
 
@@ -6,7 +6,7 @@
 
 This project is my capstone submission for [LLM Zoomcamp](https://github.com/DataTalksClub/llm-zoomcamp), a free course on building LLM applications by DataTalksClub. I built a retrieval-augmented (RAG) assistant that answers plain-English questions about integrating Stripe payments. Every answer is grounded in the official Stripe documentation and cites its sources. When the answer is an executable payment flow, the assistant can also prove it by running the flow in Stripe's test sandbox and showing the real API responses and webhook events.
 
-**Live demo:** https://stripe-coding-assistant.streamlit.app (runs on free tiers, so the first load after idling can take ~30 seconds)
+**Live demo:** https://stripe-coding-assistant.streamlit.app (the URL still carries the project's original name; runs on free tiers, so the first load after idling can take ~30 seconds)
 
 ## Table of Contents
 
