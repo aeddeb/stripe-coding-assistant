@@ -17,6 +17,8 @@ stored or sent anywhere.
 
 from __future__ import annotations
 
+import html
+import json
 import logging
 import os
 import re
@@ -40,7 +42,9 @@ from agent.sandbox import (
     FLOWS,
     SandboxTrace,
     coerce_params,
+    curl_command,
     flow_catalog,
+    http_call,
     match_flow,
     preview_flow,
     run_flow,
@@ -97,11 +101,14 @@ EXAMPLE_QUESTIONS = [
 ]
 
 # What the progress line says while each pipeline stage runs. The pipeline
-# reports stage keys and the wording lives here, in the UI.
+# reports stage keys and the wording lives here, in the UI. Retrieval
+# finishes in well under a second, so a label of its own only ever flashed —
+# it shares one label with generation, and the update between the two stages
+# is a visual no-op.
 STAGE_LABELS = {
     "routing": "Understanding the question…",
-    "retrieval": "Searching the Stripe docs…",
-    "generation": "Writing a grounded answer…",
+    "retrieval": "Searching the Stripe docs and writing a cited answer…",
+    "generation": "Searching the Stripe docs and writing a cited answer…",
 }
 
 # What "this answer contains code" looks like: a fenced block. Inline
@@ -456,17 +463,28 @@ def _render_sandbox(entry: dict) -> None:
         )
         return
 
+    _sandbox_panel(entry, flow_key)
+
+
+@st.fragment
+def _sandbox_panel(entry: dict, flow_key: str) -> None:
+    """The interactive sandbox panel for one answer.
+
+    A fragment on purpose: clicking Run reruns only this panel, so the rest
+    of the page stays live instead of dimming and locking up for the however
+    many seconds the flow takes to execute.
+    """
     flow = FLOWS[flow_key]
     params = coerce_params(flow_key, entry.get("sandbox_params"))
     widget_key = entry.get("widget_key") or entry.get("message_id") or "draft"
     trace_key = f"sandbox_trace_{widget_key}"
     run_key = f"sandbox_btn_{widget_key}"
-    # Streamlit builds an expander closed unless told otherwise, and every
-    # click reruns the whole script — so the panel used to shut itself on
-    # exactly the rerun that produced the trace, hiding the result the user
-    # had just asked for. Both conditions are needed: on the run itself the
-    # trace does not exist yet, and the button's click is readable here
-    # because the rerun it triggers carries its value in session state.
+    # Streamlit builds an expander closed unless told otherwise, and a rerun
+    # rebuilds it — so the panel used to shut itself on exactly the rerun
+    # that produced the trace, hiding the result the user had just asked
+    # for. Both conditions are needed: on the run itself the trace does not
+    # exist yet, and the button's click is readable here because the rerun
+    # it triggers carries its value in session state.
     just_ran = bool(st.session_state.get(run_key))
 
     with st.expander(
@@ -475,8 +493,9 @@ def _render_sandbox(entry: dict) -> None:
     ):
         st.caption(
             f"This executes **{flow.label}** against Stripe's test-mode "
-            "sandbox — real API calls, no real money. The payloads below are "
-            "exactly what will be sent."
+            "sandbox — real API calls, no real money. Each request below is "
+            "a runnable curl command: copy it to replay a step in your own "
+            "terminal with your own `sk_test_…` key."
         )
         if params:
             st.caption(
@@ -486,54 +505,124 @@ def _render_sandbox(entry: dict) -> None:
                     for name, value in params.items()
                 )
             )
-        # Written after the run button so a finished run can collapse the
-        # plan it has replaced; the container holds the slot up here.
-        plan_box = st.container()
+        # The button sits above the payloads so it stays in the same spot
+        # before and after a run, instead of jumping when the plan below is
+        # replaced by the executed trace.
         if st.button("▶ Run it", key=run_key):
             with st.spinner("Executing against Stripe test mode…"):
                 st.session_state[trace_key] = run_flow(flow_key, params)
         trace = st.session_state.get(trace_key)
-        with plan_box:
-            for i, planned in enumerate(preview_flow(flow_key, params), start=1):
-                if trace:
-                    # The trace below shows each request beside what it
-                    # returned, so the payloads here would only repeat it.
-                    st.markdown(f"{i}. `{planned['call']}` — {planned['note']}")
-                else:
-                    st.markdown(f"**{i}. `{planned['call']}`** — {planned['note']}")
-                    st.json(planned["request"], expanded=False)
         if trace:
-            _render_trace(trace)
+            _render_trace(trace, widget_key)
+        else:
+            # Pre-run plan: the same step cards the trace will use, but
+            # with only the request half — there is no response yet. The
+            # executed trace shows every planned request beside what it
+            # returned, so rendering the plan too would only repeat it.
+            for i, planned in enumerate(preview_flow(flow_key, params), start=1):
+                _step_header(
+                    i, planned["call"], planned["request"], note=planned["note"]
+                )
+                st.code(
+                    curl_command(planned["call"], planned["request"]),
+                    language="bash",
+                )
 
 
-def _render_trace(trace: SandboxTrace) -> None:
+# Fixed colors chosen to stay readable on Streamlit's light and dark themes.
+_PILL_OK = "background:rgba(30,166,114,.16);color:#1ea672;"
+_PILL_FAIL = "background:rgba(214,69,69,.16);color:#e05252;"
+_PILL_PLAN = "background:rgba(107,114,128,.16);color:#8b93a1;"
+_MUTED = "color:#8b93a1;"
+
+
+def _step_header(
+    i: int,
+    call: str,
+    request: dict,
+    *,
+    status: str | None = None,
+    failed: bool = False,
+    object_id: str = "",
+    note: str = "",
+) -> None:
+    """One always-visible timeline row per API call: verb, path, status
+    pill, object id, note. The payloads live in the tabs beneath it, so the
+    whole flow's shape is readable without opening anything."""
+    verb, path = http_call(call, request)
+    pill_style = _PILL_FAIL if failed else (_PILL_OK if status else _PILL_PLAN)
+    pill = (
+        f"<span style='{pill_style}border-radius:999px;padding:1px 9px;"
+        f"font-size:0.72rem;font-weight:700;'>{html.escape(status or 'planned')}</span>"
+    )
+    obj = (
+        f" <span style='{_MUTED}font-size:0.78rem;'>{html.escape(object_id)}</span>"
+        if object_id
+        else ""
+    )
+    note_html = (
+        f"<span style='{_MUTED}font-size:0.8rem;font-family:sans-serif;'>"
+        f" — {html.escape(note)}</span>"
+        if note
+        else ""
+    )
+    st.markdown(
+        "<div style='font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"
+        "font-size:0.88rem;margin:0.4rem 0 0.1rem;'>"
+        f"<span style='{_MUTED}'>{i}</span>&nbsp; "
+        f"<strong style='color:#635bff;'>{verb}</strong> "
+        f"<strong>{html.escape(path)}</strong>&nbsp; {pill}{obj}{note_html}"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_trace(trace: SandboxTrace, key_prefix: str) -> None:
     if trace.error:
         st.error(trace.error)
         return
-    # Each step carries its own request, so the call is shown next to what
-    # it returned. The pre-run plan above collapses to one line per step
-    # once this exists, rather than repeating the payloads.
     st.markdown(f"**{trace.title}** — executed:")
     for i, step in enumerate(trace.steps, start=1):
         # A decline is the point of its flow, not a malfunction — mark it as
         # a result, with the error Stripe returned as the response body.
-        arrow = "✕" if step.failed else "→"
-        target = f" `{step.object_id}`" if step.object_id else ""
-        st.markdown(
-            f"**{i}. `{step.call}`** {arrow}{target} — "
-            f"status **`{step.status}`**, {step.note}"
+        _step_header(
+            i,
+            step.call,
+            step.request,
+            status=step.status,
+            failed=step.failed,
+            object_id=step.object_id,
+            note=step.note,
         )
+        # A segmented control instead of st.tabs: tabs always open on their
+        # first tab, and here the request should read first but the response
+        # — what the reader clicked Run to see — should be what opens.
+        pane = st.segmented_control(
+            "Payload",
+            ["cURL", "Response"],
+            default="Response",
+            key=f"sandbox_pane_{key_prefix}_{i}",
+            label_visibility="collapsed",
+        )
+        if pane == "cURL":
+            st.code(curl_command(step.call, step.request), language="bash")
+        elif pane == "Response":
+            st.caption(
+                "The error Stripe replied with" if step.failed
+                else "Null fields omitted"
+            )
+            st.code(json.dumps(step.response, indent=2), language="json")
+        # pane is None when the reader deselects — the card collapses to
+        # its header row, which is a reasonable reading of that click.
         if step.link:
-            st.markdown(f"[Open the Checkout page ↗]({step.link})")
-        st.caption("Sent")
-        st.json(step.request, expanded=False)
-        st.caption(
-            "Returned — the error Stripe replied with" if step.failed
-            else "Returned (null fields omitted)"
-        )
-        st.json(step.response, expanded=False)
+            st.markdown(f"[Open the payment page ↗]({step.link})")
     if trace.events:
-        st.markdown("**Events Stripe recorded** (what your webhook would receive):")
+        st.markdown("**Events Stripe recorded** — what your webhook would receive:")
+        st.caption(
+            "Stripe records everything that happens as events and POSTs each "
+            "one to your webhook endpoint. Fulfillment, emails, and access "
+            "should key off these events — not the API response."
+        )
         st.markdown(" → ".join(f"`{e['type']}`" for e in trace.events))
     st.caption(
         f"Executed in {trace.duration_ms} ms against Stripe test mode. "

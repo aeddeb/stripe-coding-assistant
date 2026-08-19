@@ -37,6 +37,8 @@ import stripe
 # call sequence, not currency handling.
 CURRENCY = "usd"
 TEST_CARD = "pm_card_visa"
+# Stripe's test card that succeeds, then immediately gets disputed as fraud.
+DISPUTE_CARD = "pm_card_createDispute"
 
 
 @dataclass
@@ -283,6 +285,92 @@ def _guarded(flow_key: str, title: str, body: Callable[[_Run], None]) -> Sandbox
     return run.trace
 
 
+# --- HTTP wire form --------------------------------------------------------
+# A trace step records an SDK-style call name ("PaymentIntent.create") plus
+# the exact params sent. The UI shows each step as the HTTP request it
+# becomes — a runnable curl command — so any step can be copied into a
+# terminal and replayed against the reader's own test key.
+
+# call name -> (verb, path template, request key whose value goes in the path).
+_ENDPOINTS: dict[str, tuple[str, str, str | None]] = {
+    "PaymentIntent.create": ("POST", "/v1/payment_intents", None),
+    "PaymentIntent.capture": ("POST", "/v1/payment_intents/{id}/capture", "payment_intent"),
+    "PaymentIntent.cancel": ("POST", "/v1/payment_intents/{id}/cancel", "payment_intent"),
+    "Refund.create": ("POST", "/v1/refunds", None),
+    "Customer.create": ("POST", "/v1/customers", None),
+    "Customer.update": ("POST", "/v1/customers/{id}", "customer"),
+    "PaymentMethod.attach": ("POST", "/v1/payment_methods/{id}/attach", "payment_method"),
+    "Price.create": ("POST", "/v1/prices", None),
+    "Subscription.create": ("POST", "/v1/subscriptions", None),
+    "Subscription.update": ("POST", "/v1/subscriptions/{id}", "subscription"),
+    "SetupIntent.create": ("POST", "/v1/setup_intents", None),
+    "checkout.Session.create": ("POST", "/v1/checkout/sessions", None),
+    "PaymentLink.create": ("POST", "/v1/payment_links", None),
+    "Dispute.retrieve": ("GET", "/v1/disputes/{id}", "dispute"),
+    "Dispute.update": ("POST", "/v1/disputes/{id}", "dispute"),
+}
+
+_PLACEHOLDER = re.compile(r"^<.+>$")  # preview stand-ins like "<customer id>"
+
+
+def http_call(call: str, request: dict) -> tuple[str, str]:
+    """('POST', '/v1/payment_intents/pi_123/capture') for a recorded step."""
+    verb, path, id_key = _ENDPOINTS.get(call, ("POST", f"/v1/{call}", None))
+    if id_key:
+        path = path.replace("{id}", str(request.get(id_key, "{id}")))
+    return verb, path
+
+
+def _form_fields(value: Any, prefix: str = ""):
+    """Flatten a params dict into Stripe's form encoding:
+    {"items": [{"price": "p"}]} -> [("items[0][price]", "p")]."""
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            yield from _form_fields(inner, f"{prefix}[{key}]" if prefix else str(key))
+    elif isinstance(value, (list, tuple)):
+        for i, inner in enumerate(value):
+            yield from _form_fields(inner, f"{prefix}[{i}]")
+    elif isinstance(value, bool):
+        yield prefix, "true" if value else "false"
+    else:
+        yield prefix, str(value)
+
+
+_PLAIN = re.compile(r"^[A-Za-z0-9_.:/@-]+$")
+
+
+def curl_command(call: str, request: dict) -> str:
+    """The step as a runnable curl command. Preview placeholders
+    ("<customer id>") pass through untouched, flagged by a comment line."""
+    verb, path = http_call(call, request)
+    id_key = _ENDPOINTS.get(call, ("", "", None))[2]
+    body = {k: v for k, v in request.items() if k != id_key}
+    fields = list(_form_fields(body))
+    lines = []
+    if any(_PLACEHOLDER.match(v) for _, v in fields) or "<" in path:
+        lines.append("# values in <angle brackets> come from an earlier step's response")
+    # -G moves the -d fields into the query string; a bare GET needs nothing.
+    flag = "-G " if verb == "GET" and fields else ""
+    lines.append(f"curl {flag}https://api.stripe.com{path} \\")
+    auth = '  -u "$STRIPE_SECRET_KEY:"'
+    if not fields:
+        if verb == "GET":
+            lines.append(auth)
+            return "\n".join(lines)
+        # curl needs the verb spelled out when there is no -d to imply POST.
+        lines.append(auth + " \\")
+        lines.append("  -X POST")
+        return "\n".join(lines)
+    lines.append(auth + " \\")
+    for i, (key, value) in enumerate(fields):
+        pair = f"{key}={value}"
+        if not (_PLAIN.match(key) and _PLAIN.match(str(value))):
+            pair = f'"{pair}"'
+        tail = " \\" if i < len(fields) - 1 else ""
+        lines.append(f"  -d {pair}{tail}")
+    return "\n".join(lines)
+
+
 # --- Shared request builders ----------------------------------------------
 # Both the preview and the execution call these, so the payload a user sees
 # before clicking is by construction the payload that gets sent.
@@ -308,9 +396,12 @@ def _recurring_price_request(amount_cents: int, name: str) -> dict:
     }
 
 
-def _subscribe_customer(run: _Run, monthly_cents: int, plan_name: str):
+def _subscribe_customer(
+    run: _Run, monthly_cents: int, plan_name: str, trial_days: int | None = None
+):
     """Create a price, a customer with a saved test card, and subscribe
-    them. Shared by the two subscription flows."""
+    them. Shared by the subscription flows; ``trial_days`` delays the first
+    charge behind a free trial."""
     price_req = _recurring_price_request(monthly_cents, plan_name)
     price = run.record(
         "Price.create", price_req, run.client.v1.prices.create(params=price_req),
@@ -333,16 +424,25 @@ def _subscribe_customer(run: _Run, monthly_cents: int, plan_name: str):
         run.client.v1.customers.update(customer.id, params=default_req),
         note="make it the default for invoices",
     )
-    sub_req = {"customer": customer.id, "items": [{"price": price.id}]}
+    sub_req: dict = {"customer": customer.id, "items": [{"price": price.id}]}
+    if trial_days:
+        sub_req["trial_period_days"] = trial_days
     subscription = run.record(
         "Subscription.create", sub_req,
         run.client.v1.subscriptions.create(params=sub_req),
-        note="first invoice is charged immediately",
+        note=(
+            f"free for {trial_days} days — the first charge comes when the "
+            "trial ends"
+            if trial_days
+            else "first invoice is charged immediately"
+        ),
     )
     return subscription
 
 
-def _subscribe_plan_steps(monthly_cents: int, plan_name: str) -> list[dict]:
+def _subscribe_plan_steps(
+    monthly_cents: int, plan_name: str, trial_days: int | None = None
+) -> list[dict]:
     """Preview counterpart to ``_subscribe_customer``."""
     return [
         {
@@ -370,8 +470,17 @@ def _subscribe_plan_steps(monthly_cents: int, plan_name: str) -> list[dict]:
         },
         {
             "call": "Subscription.create",
-            "request": {"customer": "<customer id>", "items": [{"price": "<price id>"}]},
-            "note": "first invoice is charged immediately",
+            "request": {
+                "customer": "<customer id>",
+                "items": [{"price": "<price id>"}],
+                **({"trial_period_days": trial_days} if trial_days else {}),
+            },
+            "note": (
+                f"free for {trial_days} days — the first charge comes when "
+                "the trial ends"
+                if trial_days
+                else "first invoice is charged immediately"
+            ),
         },
     ]
 
@@ -428,10 +537,43 @@ def run_payment_and_refund(amount_cents: int = 2000, refund_amount_cents: int = 
     return _guarded("payment_and_refund", title, body)
 
 
+# --- Flow: charge a card ---------------------------------------------------
+
+
+def plan_charge_card(amount_cents: int) -> list[dict]:
+    return [
+        {
+            "call": "PaymentIntent.create",
+            "request": _payment_request(amount_cents),
+            "note": f"charge {_money(amount_cents)} to a test card",
+        }
+    ]
+
+
+def run_charge_card(amount_cents: int = 2000) -> SandboxTrace:
+    title = f"Charge {_money(amount_cents)} to a test card"
+
+    def body(run: _Run):
+        req = _payment_request(amount_cents)
+        run.record(
+            "PaymentIntent.create", req,
+            run.client.v1.payment_intents.create(params=req),
+            note="the customer is charged",
+        )
+
+    return _guarded("charge_card", title, body)
+
+
 # --- Flow: hold and capture ------------------------------------------------
 
 
-def plan_hold_and_capture(amount_cents: int) -> list[dict]:
+def plan_hold_and_capture(
+    amount_cents: int, capture_amount_cents: int = 0
+) -> list[dict]:
+    partial = 0 < capture_amount_cents < amount_cents
+    capture_req: dict = {"payment_intent": "<id returned by step 1>"}
+    if partial:
+        capture_req["amount_to_capture"] = capture_amount_cents
     return [
         {
             "call": "PaymentIntent.create",
@@ -440,14 +582,24 @@ def plan_hold_and_capture(amount_cents: int) -> list[dict]:
         },
         {
             "call": "PaymentIntent.capture",
-            "request": {"payment_intent": "<id returned by step 1>"},
-            "note": "captures the held funds",
+            "request": capture_req,
+            "note": (
+                f"captures {_money(capture_amount_cents)} — the rest of the "
+                "hold is released"
+                if partial
+                else "captures the held funds"
+            ),
         },
     ]
 
 
-def run_hold_and_capture(amount_cents: int = 5000) -> SandboxTrace:
-    title = f"Hold {_money(amount_cents)} on a test card, then capture it"
+def run_hold_and_capture(
+    amount_cents: int = 5000, capture_amount_cents: int = 0
+) -> SandboxTrace:
+    partial = 0 < capture_amount_cents < amount_cents
+    title = f"Hold {_money(amount_cents)} on a test card, then capture " + (
+        _money(capture_amount_cents) if partial else "it"
+    )
 
     def body(run: _Run):
         create_req = _payment_request(amount_cents, capture_method="manual")
@@ -456,10 +608,19 @@ def run_hold_and_capture(amount_cents: int = 5000) -> SandboxTrace:
             run.client.v1.payment_intents.create(params=create_req),
             note="money is held on the card, not yet moved",
         )
+        capture_req: dict = {"payment_intent": intent.id}
+        capture_params: dict = {}
+        if partial:
+            capture_req["amount_to_capture"] = capture_amount_cents
+            capture_params["amount_to_capture"] = capture_amount_cents
         run.record(
-            "PaymentIntent.capture", {"payment_intent": intent.id},
-            run.client.v1.payment_intents.capture(intent.id),
-            note="the held funds are now captured",
+            "PaymentIntent.capture", capture_req,
+            run.client.v1.payment_intents.capture(intent.id, params=capture_params),
+            note=(
+                "the captured part moves; the rest of the hold is released"
+                if partial
+                else "the held funds are now captured"
+            ),
         )
 
     return _guarded("hold_and_capture", title, body)
@@ -588,6 +749,27 @@ def run_subscription_change_price(
     return _guarded("subscription_change_price", title, body)
 
 
+# --- Flow: subscription with a free trial ----------------------------------
+
+
+def plan_subscription_trial(monthly_amount_cents: int, trial_days: int) -> list[dict]:
+    return _subscribe_plan_steps(monthly_amount_cents, "Sandbox demo plan", trial_days)
+
+
+def run_subscription_trial(
+    monthly_amount_cents: int = 1200, trial_days: int = 14
+) -> SandboxTrace:
+    title = (
+        f"Start a {_money(monthly_amount_cents)}/month subscription with a "
+        f"{trial_days}-day free trial"
+    )
+
+    def body(run: _Run):
+        _subscribe_customer(run, monthly_amount_cents, "Sandbox demo plan", trial_days)
+
+    return _guarded("subscription_trial", title, body)
+
+
 # --- Flow: checkout session -----------------------------------------------
 
 
@@ -632,6 +814,53 @@ def run_checkout_session(amount_cents: int = 2500) -> SandboxTrace:
         )
 
     return _guarded("checkout_session", title, body)
+
+
+# --- Flow: payment link ----------------------------------------------------
+
+
+def _one_time_price_request(amount_cents: int) -> dict:
+    return {
+        "currency": CURRENCY,
+        "unit_amount": amount_cents,
+        "product_data": {"name": "Sandbox demo item"},
+    }
+
+
+def plan_payment_link(amount_cents: int) -> list[dict]:
+    return [
+        {
+            "call": "Price.create",
+            "request": _one_time_price_request(amount_cents),
+            "note": f"a one-time {_money(amount_cents)} price for the link to sell",
+        },
+        {
+            "call": "PaymentLink.create",
+            "request": {"line_items": [{"price": "<price id>", "quantity": 1}]},
+            "note": "returns a reusable payment page URL you can share anywhere",
+        },
+    ]
+
+
+def run_payment_link(amount_cents: int = 2500) -> SandboxTrace:
+    title = f"Create a shareable Payment Link for {_money(amount_cents)}"
+
+    def body(run: _Run):
+        price_req = _one_time_price_request(amount_cents)
+        price = run.record(
+            "Price.create", price_req,
+            run.client.v1.prices.create(params=price_req),
+            note="the product the link sells",
+        )
+        link_req = {"line_items": [{"price": price.id, "quantity": 1}]}
+        link = run.client.v1.payment_links.create(params=link_req)
+        run.record(
+            "PaymentLink.create", link_req, link,
+            note="share this URL anywhere — no code on your site",
+            link=getattr(link, "url", None),
+        )
+
+    return _guarded("payment_link", title, body)
 
 
 # --- Flow: save a card and charge it later --------------------------------
@@ -761,6 +990,81 @@ def run_declined_card(decline_type: str = "generic") -> SandboxTrace:
     return _guarded("declined_card", title, body)
 
 
+# --- Flow: dispute ---------------------------------------------------------
+
+
+def plan_dispute(amount_cents: int) -> list[dict]:
+    return [
+        {
+            "call": "PaymentIntent.create",
+            "request": _payment_request(amount_cents, payment_method=DISPUTE_CARD),
+            "note": "charge a test card that always triggers a dispute",
+        },
+        {
+            "call": "Dispute.retrieve",
+            "request": {"dispute": "<dispute id — Stripe opens it moments after the charge>"},
+            "note": "read the dispute the cardholder's bank opened",
+        },
+        {
+            "call": "Dispute.update",
+            "request": {
+                "dispute": "<dispute id>",
+                "evidence": {"uncategorized_text": "winning_evidence"},
+                "submit": True,
+            },
+            "note": "respond with evidence — in test mode this exact text wins",
+        },
+    ]
+
+
+def run_dispute(amount_cents: int = 2000) -> SandboxTrace:
+    title = (
+        f"Charge {_money(amount_cents)}, watch it get disputed, then "
+        "respond with evidence"
+    )
+
+    def body(run: _Run):
+        pay_req = _payment_request(amount_cents, payment_method=DISPUTE_CARD)
+        intent = run.record(
+            "PaymentIntent.create", pay_req,
+            run.client.v1.payment_intents.create(params=pay_req),
+            note="the charge succeeds — the dispute lands moments later",
+        )
+        # The dispute is created asynchronously, almost always within a
+        # second or two — poll briefly instead of guessing a sleep.
+        dispute = None
+        for _ in range(15):
+            found = run.client.v1.disputes.list(
+                params={"payment_intent": intent.id, "limit": 1}
+            )
+            if found.data:
+                dispute = found.data[0]
+                break
+            time.sleep(1)
+        if dispute is None:
+            run.trace.error = (
+                "Stripe had not opened the test dispute after 15 seconds — "
+                "run the flow again."
+            )
+            return
+        dispute = run.record(
+            "Dispute.retrieve", {"dispute": dispute.id},
+            run.client.v1.disputes.retrieve(dispute.id),
+            note="the disputed money and a dispute fee are on hold",
+        )
+        update_params = {
+            "evidence": {"uncategorized_text": "winning_evidence"},
+            "submit": True,
+        }
+        run.record(
+            "Dispute.update", {"dispute": dispute.id, **update_params},
+            run.client.v1.disputes.update(dispute.id, params=update_params),
+            note="in test mode this evidence text wins the dispute",
+        )
+
+    return _guarded("dispute", title, body)
+
+
 # --- Flow registry ---------------------------------------------------------
 
 
@@ -799,7 +1103,12 @@ FLOWS: dict[str, Flow] = {
             "Authorising a payment now and capturing the money later, e.g. "
             "charging when an order ships."
         ),
-        params={"amount_cents": ParamSpec("Hold amount (cents)", 5000)},
+        params={
+            "amount_cents": ParamSpec("Hold amount (cents)", 5000),
+            "capture_amount_cents": ParamSpec(
+                "Capture amount (cents, 0 = full)", 0, minimum=0
+            ),
+        },
         plan=plan_hold_and_capture,
         run=run_hold_and_capture,
         pattern=re.compile(
@@ -818,6 +1127,23 @@ FLOWS: dict[str, Flow] = {
         plan=plan_hold_and_release,
         run=run_hold_and_release,
         pattern=re.compile(r"(cancel|release|void).{0,30}(hold|authoriz)", re.IGNORECASE),
+    ),
+    # Before the other subscription flows: "trial" is the more specific
+    # keyword, and the fallback scan takes the first pattern that matches.
+    "subscription_trial": Flow(
+        key="subscription_trial",
+        label="start a subscription with a free trial",
+        description=(
+            "Starting a subscription with a free trial — the card is saved "
+            "but nothing is charged today; billing starts when the trial ends."
+        ),
+        params={
+            "monthly_amount_cents": ParamSpec("Monthly price (cents)", 1200),
+            "trial_days": ParamSpec("Trial length (days)", 14, minimum=1, maximum=365),
+        },
+        plan=plan_subscription_trial,
+        run=run_subscription_trial,
+        pattern=re.compile(r"free trial|trial", re.IGNORECASE),
     ),
     "subscription_lifecycle": Flow(
         key="subscription_lifecycle",
@@ -858,6 +1184,18 @@ FLOWS: dict[str, Flow] = {
         run=run_checkout_session,
         pattern=re.compile(r"checkout session|checkout\.session|hosted page|payment page", re.IGNORECASE),
     ),
+    "payment_link": Flow(
+        key="payment_link",
+        label="create a shareable Payment Link",
+        description=(
+            "Creating a Payment Link — a reusable hosted payment page URL "
+            "you can share anywhere, with no code on your site."
+        ),
+        params={"amount_cents": ParamSpec("Item price (cents)", 2500)},
+        plan=plan_payment_link,
+        run=run_payment_link,
+        pattern=re.compile(r"payment.?link", re.IGNORECASE),
+    ),
     "save_card_off_session": Flow(
         key="save_card_off_session",
         label="save a card, then charge it off-session",
@@ -892,6 +1230,36 @@ FLOWS: dict[str, Flow] = {
         run=run_declined_card,
         pattern=re.compile(
             r"declin|insufficient funds|card.{0,15}fail|3d.?secure|\b3ds\b|authentication required",
+            re.IGNORECASE,
+        ),
+    ),
+    "dispute": Flow(
+        key="dispute",
+        label="get a dispute, then respond with evidence",
+        description=(
+            "What a dispute (chargeback) looks like: a charge is disputed by "
+            "the cardholder's bank, and evidence is submitted in response."
+        ),
+        params={"amount_cents": ParamSpec("Charge amount (cents)", 2000)},
+        plan=plan_dispute,
+        run=run_dispute,
+        pattern=re.compile(r"disput|chargeback", re.IGNORECASE),
+    ),
+    # Deliberately last: its pattern is the broadest, and the keyword
+    # fallback scans this dict in order — every more specific flow above
+    # gets first claim on a question before "just charge a card" does.
+    "charge_card": Flow(
+        key="charge_card",
+        label="charge a card",
+        description=(
+            "Charging a customer's card once — a plain one-time payment, "
+            "with no refund, hold, or follow-up step."
+        ),
+        params={"amount_cents": ParamSpec("Charge amount (cents)", 2000)},
+        plan=plan_charge_card,
+        run=run_charge_card,
+        pattern=re.compile(
+            r"charg|credit card|debit card|\bpay\b|one.?time payment|accept.{0,20}payment",
             re.IGNORECASE,
         ),
     ),
